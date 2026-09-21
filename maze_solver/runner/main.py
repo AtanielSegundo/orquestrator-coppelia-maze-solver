@@ -19,6 +19,12 @@ Flow:
      `goal` prompt commands) while live, the run is replanned from wherever
      the kart actually is -- current cell -> new start -> new goal -- taking
      effect at the next cell boundary, never interrupting a leg in flight.
+  6. Meanwhile the front distance sensor keeps writing into a LIVE copy of
+     the maze: anything it sees closer than OBSTACLE_DISTANCE_CM is projected
+     onto the grid and that cell is blocked, so the next replan routes around
+     it and both views draw it. The .maze file's own grid is kept untouched
+     alongside as the reference (see MazeView's original-vs-live split), and
+     `resume` restores the live one from it.
 
 Commands (`turn`, `drive_distance`, `reset_odometry`) go out over the same
 KartLink used by control_websocket.py (see shadow/), but with its teleop

@@ -11,6 +11,7 @@ class HUDColors:
     goal_cell    = pr.GREEN
     open_cell    = pr.WHITE
     wall_cell    = pr.RED
+    obstacle_cell = pr.Color(240, 140, 40, 255)   # found at runtime, not in the .maze
     start_cell   = pr.BLUE
     outline_cell = pr.BLACK
     path_cell    = pr.Color(90,  150, 240, 110)

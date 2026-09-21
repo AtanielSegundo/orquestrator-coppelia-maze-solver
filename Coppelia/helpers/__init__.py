@@ -14,10 +14,11 @@ from Coppelia.helpers.kart_center_offset import KART_CENTER_OFFSET_LOCAL
 from Coppelia.helpers.set_planar_pose import set_planar_pose
 from Coppelia.helpers.render_maze import render_maze
 from Coppelia.helpers.move_maze_marker import move_maze_marker
+from Coppelia.helpers.add_maze_obstacle import add_maze_obstacle
 
 __all__ = [
     "remove_object", "change_floor", "get_maze_tag",
     "maze_origin", "cell_to_world", "world_to_cell", "local_bounding_box",
     "KART_CENTER_OFFSET_LOCAL", "set_planar_pose", "render_maze",
-    "move_maze_marker",
+    "move_maze_marker", "add_maze_obstacle",
 ]

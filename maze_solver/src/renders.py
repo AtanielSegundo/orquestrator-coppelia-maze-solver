@@ -73,6 +73,7 @@ class MazeView:
         self._env = MazeEnv(maze_path)
         if not self._env.file_loaded:
             raise FileNotFoundError(maze_path)
+        self._snapshot_original()
         self.set_start_goal(self._env.agent_start,self._env.agent_goal)
         self.recompute()
 
@@ -83,6 +84,7 @@ class MazeView:
             return False
         del self._env
         self._env = m
+        self._snapshot_original()
         self.set_start_goal(m.agent_start,m.agent_goal)
         self.recompute()
         return True
@@ -119,7 +121,55 @@ class MazeView:
         return 0 <= cell[0] < self.rows and 0 <= cell[1] < self.cols
     
     def is_wall(self,cell:Tuple[int,int]) -> bool:
+        """Wall in the LIVE maze -- the .maze file's own walls PLUS whatever
+        the kart has discovered blocked since. This is what solve_bfs() reads,
+        so a discovered obstacle is routed around like any other wall."""
         return self._env.getStateGridCell(cell) is GridCell.WALL
+
+    # ---- original (file) maze vs live maze ---------------------------------
+    # `self._env.grid` is the LIVE maze: is_wall(), solve_bfs() and render()
+    # all read it, and obstacles the front distance sensor finds at runtime
+    # get written into it. `self._original_grid` keeps the pristine copy the
+    # .maze file loaded with, so a discovery can always be told apart from a
+    # wall that was there all along -- and undone without re-reading the file.
+    def _snapshot_original(self):
+        # Two independent, WRITABLE copies. A .maze file is loaded with
+        # np.frombuffer() over immutable bytes, so MazeEnv's own grid comes
+        # back read-only -- marking an obstacle on it raises. Copying both
+        # sides also guarantees the live grid can never alias the reference.
+        self._original_grid = self._env.grid.copy()
+        self._env.grid = self._env.grid.copy()
+        self._obstacles = set()
+
+    @property
+    def obstacles(self) -> Set[Tuple[int,int]]:
+        """Cells discovered blocked at runtime (live maze only, never the
+        file's own walls)."""
+        return set(self._obstacles)
+
+    def is_original_wall(self,cell:Tuple[int,int]) -> bool:
+        """Wall in the ORIGINAL .maze file, ignoring runtime discoveries."""
+        if not self.in_bounds(cell):
+            return True
+        # bool(): the grid is numpy, and a bare np.bool_ breaks callers
+        # doing `is True` / `is False` checks.
+        return bool(self._original_grid[cell[0],cell[1]] == GridCell.WALL.value)
+
+    def mark_obstacle(self,cell:Tuple[int,int]) -> bool:
+        """Block `cell` in the LIVE maze. Returns True ONLY the first time a
+        cell actually becomes newly blocked -- an out-of-bounds cell, one the
+        file already walls off, or one discovered earlier all return False, so
+        callers can log and replan exactly once per discovery."""
+        if not self.in_bounds(cell) or self.is_wall(cell):
+            return False
+        self._env.grid[cell[0],cell[1]] = GridCell.WALL.value
+        self._obstacles.add((cell[0],cell[1]))
+        return True
+
+    def clear_obstacles(self):
+        """Drop every runtime discovery: live maze back to the file's."""
+        self._env.grid[:] = self._original_grid
+        self._obstacles.clear()
     
     def recompute(self):
         w = pr.get_screen_width()  - 2 * HUD.PAD
@@ -154,6 +204,9 @@ class MazeView:
                 x, y, w, h = self.cell_rect(r, c)
                 wall = (self._env.getStateGridCell((r, c)) is GridCell.WALL)
                 rect_color = HUDColors.wall_cell if wall else HUDColors.open_cell
+                
+                if (r, c) in self._obstacles:      # found by the kart, not the file
+                    rect_color = HUDColors.obstacle_cell
                 
                 if self.is_cell_equal(self._start,(r,c)):
                     rect_color = HUDColors.start_cell
