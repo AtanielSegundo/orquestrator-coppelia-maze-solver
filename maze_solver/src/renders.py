@@ -166,6 +166,19 @@ class MazeView:
         self._obstacles.add((cell[0],cell[1]))
         return True
 
+    def clear_obstacle(self,cell:Tuple[int,int]) -> bool:
+        """Undo ONE runtime discovery: `cell` goes back to whatever the .maze
+        file says it is. Returns True only when a discovery was really dropped,
+        so callers can log and replan exactly once. The file's own walls are
+        not discoveries and are never touched -- they are ground truth, and no
+        sensor reading gets to revise them."""
+        key = (cell[0],cell[1])
+        if key not in self._obstacles:
+            return False
+        self._env.grid[key[0],key[1]] = self._original_grid[key[0],key[1]]
+        self._obstacles.discard(key)
+        return True
+
     def clear_obstacles(self):
         """Drop every runtime discovery: live maze back to the file's."""
         self._env.grid[:] = self._original_grid

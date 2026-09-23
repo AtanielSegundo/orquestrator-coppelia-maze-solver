@@ -16,6 +16,7 @@ process; the kernel closes it whenever this process ends, however it
 ends, and immediately terminates every process still in the job.
 """
 import os
+import psutil
 import ctypes
 import subprocess
 from ctypes import wintypes
@@ -95,41 +96,58 @@ def _kill_on_close_job():
 
 def _adopt(process: subprocess.Popen) -> bool:
     """Put `process` (and every process it spawns) in the kill-on-close job."""
+    process_pid = (int(process._handle) 
+                   if isinstance(process,subprocess.Popen) 
+                   else process)
+    
     if not _IS_WINDOWS:
         return False
+    
     try:
         job = _kill_on_close_job()
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
         k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-        if not k32.AssignProcessToJobObject(job, int(process._handle)):
+        if not k32.AssignProcessToJobObject(job, process_pid):
             raise ctypes.WinError(ctypes.get_last_error())
         return True
+    
     except OSError as exc:
         # Not fatal: we simply fall back to the best-effort terminate below.
         print(f"[WARN] nao foi possivel prender o CoppeliaSim ao job: {exc}")
         return False
 
+def  _is_coppelia_runing():
+    for proc in psutil.process_iter(["pid","name"]):
+        if "coppeliaSim" in proc.info["name"]:
+            return int(proc.info["pid"])
+    return None
 
 # Start CoppeliaSim and Leaves, raise EVOKE_ERROR
-def evoke_coppelia() -> subprocess.Popen:
+def evoke_coppelia(should_adopt:bool) -> subprocess.Popen:
     creationflags = 0
-    if _IS_WINDOWS:
-        # CREATE_BREAKAWAY_FROM_JOB lets us re-parent the child into our own
-        # job even when this process was itself started inside one that does
-        # not allow silent nesting.
-        creationflags = (subprocess.CREATE_NEW_CONSOLE
-                         | subprocess.CREATE_BREAKAWAY_FROM_JOB)
+    
+    process = _is_coppelia_runing()
+    
+    if not process:
+        _flags = subprocess.CREATE_BREAKAWAY_FROM_JOB if should_adopt else 0x00
+        if _IS_WINDOWS:
+            # CREATE_BREAKAWAY_FROM_JOB lets us re-parent the child into our own
+            # job even when this process was itself started inside one that does
+            # not allow silent nesting.
+            creationflags = (subprocess.CREATE_NEW_CONSOLE | _flags)
 
-    try:
-        process = subprocess.Popen([PATHS.COPPELIA_BINARY],
-                                   creationflags=creationflags)
-    except OSError:
-        # The current job forbids breakaway -- retry without it.
-        process = subprocess.Popen([PATHS.COPPELIA_BINARY],
-                                   creationflags=subprocess.CREATE_NEW_CONSOLE
-                                   if _IS_WINDOWS else 0)
+        try:
+            process = subprocess.Popen([PATHS.COPPELIA_BINARY],
+                                    creationflags=creationflags)
+        except OSError:
+            # The current job forbids breakaway -- retry without it.
+            process = subprocess.Popen([PATHS.COPPELIA_BINARY],
+                                    creationflags=subprocess.CREATE_NEW_CONSOLE
+                                    if _IS_WINDOWS else 0)
 
-    _adopt(process)
+    if should_adopt:
+        _adopt(process)
+    
     return process
 
 
@@ -139,6 +157,15 @@ def terminate_coppelia(process: subprocess.Popen, timeout: float = 10.0) -> None
     The job object already covers the abnormal paths; this just gives the
     simulator a chance to exit cleanly while we are still alive.
     """
+    _SIGTERM = 15
+    if isinstance(process,int):
+        os.kill(process,_SIGTERM)
+        if _IS_WINDOWS:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(process)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            check=False)
+        return
+
     if process is None or process.poll() is not None:
         return
 

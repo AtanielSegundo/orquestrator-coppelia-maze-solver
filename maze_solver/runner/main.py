@@ -20,18 +20,13 @@ Flow:
      the kart actually is -- current cell -> new start -> new goal -- taking
      effect at the next cell boundary, never interrupting a leg in flight.
   6. Meanwhile the front distance sensor keeps writing into a LIVE copy of
-     the maze: anything it sees closer than OBSTACLE_DISTANCE_CM is projected
-     onto the grid and that cell is blocked, so the next replan routes around
-     it and both views draw it. The .maze file's own grid is kept untouched
-     alongside as the reference (see MazeView's original-vs-live split), and
-     `resume` restores the live one from it.
-
-Commands (`turn`, `drive_distance`, `reset_odometry`) go out over the same
-KartLink used by control_websocket.py (see shadow/), but with its teleop
-keepalive OFF: a repeating zero-velocity `drive` message would cancel any
-in-flight move server-side (DriveController.set_twist unconditionally clears
-`_move`/`_heading_target`), so this link only ever sends the discrete
-commands the maze run issues, one at a time.
+     the maze, both ways: anything it sees closer than OBSTACLE_DISTANCE_CM is
+     projected onto the grid and that cell is blocked, while the cells the beam
+     passed through to get there are un-blocked again. So an obstacle that gets
+     taken away is noticed, and a run with no route left re-plans itself and
+     carries on -- no `resume` needed. The .maze file's own grid is kept
+     untouched alongside as the reference (see MazeView's original-vs-live
+     split), and `resume` restores the live one from it wholesale.
 
 Deps:  pip install websocket-client pyray coppeliasim_zmqremoteapi_client
 """
@@ -56,13 +51,14 @@ from runner.coppelia_evoke   import (evoke_coppelia, load_scene_in_coppelia,
 
 def main():
     args = build_parser().parse_args()
-
     maze_path = resolve_maze(args.maze)
     if maze_path is None:
         print(f"[ERROR] maze nao encontrado: {args.maze}")
         sys.exit(-1)
 
-    coppelia_process = evoke_coppelia()
+    _should_adopt_coppelia_process = not args.coppelia_detach   
+    coppelia_process = evoke_coppelia(_should_adopt_coppelia_process)
+
     client = RemoteAPIClient()
     
     sim = client.require("sim")
@@ -160,6 +156,7 @@ def main():
         runner.stop()
         # Closing normaly. If we are killed hard instead, the job object
         # created in coppelia_evoke takes CoppeliaSim down with us.
-        terminate_coppelia(coppelia_process)
+        if _should_adopt_coppelia_process:
+            terminate_coppelia(coppelia_process)
         pr.close_window()
         print("[INFO] encerrado")

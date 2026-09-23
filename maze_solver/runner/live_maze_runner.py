@@ -1,4 +1,5 @@
 import math
+import time
 from typing import List, Optional, Tuple
 
 import pyray as pr
@@ -13,8 +14,9 @@ from src.renders import HUDView, KartView, MazeView
 from src.solver import solve_bfs, heading_between
 
 from runner.constants import (
-    CAIXA_COR, GRID_HEADING_LABEL,
-    OBSTACLE_DISTANCE_CM, SENSOR_FORWARD_OFFSET_M, SENSOR_FROZEN_TRAVEL_M,
+    CAIXA_COR, GRID_HEADING_LABEL, LIVE_RETRY_INTERVAL_S,
+    OBSTACLE_DISTANCE_CM, SENSOR_CLEAR_CONFIRMATIONS,
+    SENSOR_FORWARD_OFFSET_M, SENSOR_FROZEN_TRAVEL_M,
 )
 from runner.leg import Leg
 
@@ -30,8 +32,16 @@ class LiveMazeRunner:
 
     `state` -- only meaningful once `phase == "live"`: "running" (driving a
         leg or about to start the next one), "idle" (goal reached, waiting
-        for a new one) or "blocked" (a leg came up short -- obstacle or
-        stall -- waiting for the operator to clear it and `resume`).
+        for a new one), "blocked" (a leg came up short -- obstacle or stall)
+        or "waiting" (no route to the goal through the live maze right now).
+
+    The last two are holding patterns, NOT dead ends: the front sensor keeps
+    writing the live maze while stopped, and both states re-run the planner on
+    their own -- immediately when the live maze changes, and on a slow timer
+    otherwise. Take a box off the floor and the kart sees the cell go clear,
+    un-discovers it, finds a route and drives off without being told. `resume`
+    is still there as the big hammer (forget EVERY discovery at once), but
+    nothing waits for it anymore.
     """
 
     def __init__(self, sim, kart_base, motors, maze_path: str,
@@ -39,16 +49,16 @@ class LiveMazeRunner:
                 cell_length: float, ws_url: str,
                 turn_speed: float, drive_speed: float,
                 video_url: str, command_url: str, video_backend: str = "sim"):
-        self.sim = sim
-        self.kart_base = kart_base
-        self.motors = motors
-        self.maze_path = maze_path
-        self.view = view
-        self.kart_view = kart_view
-        self.hud = HUDView()
+        self.sim         = sim
+        self.kart_base   = kart_base
+        self.motors      = motors
+        self.maze_path   = maze_path
+        self.view        = view
+        self.kart_view   = kart_view
+        self.hud         = HUDView()
         self.cell_length = cell_length
-        self.ws_url = ws_url
-        self.turn_speed = turn_speed
+        self.ws_url      = ws_url
+        self.turn_speed  = turn_speed
         self.drive_speed = drive_speed
 
         # Video/pan-tilt mirror. Fully independent of the kart WS link (video
@@ -59,11 +69,11 @@ class LiveMazeRunner:
                                    video_url=video_url, command_url=command_url,
                                    video=video_backend)
 
-        self.origin = None                     # Coppelia world origin, cell (0,0)
-        self.maze_tag = None                   # for the {tag}_start/{tag}_goal markers
-        self.link: Optional[KartLink] = None
+        self.origin                      = None # Coppelia world origin, cell (0,0)
+        self.maze_tag                    = None # for the {tag}_start/{tag}_goal markers
+        self.link: Optional[KartLink]    = None
         self.mirror: Optional[SimMirror] = None
-        self.odom_ref = None
+        self.odom_ref                    = None
 
         self.phase = "setup"
         self.state = "running"
@@ -82,6 +92,16 @@ class LiveMazeRunner:
         self.obstacles_found = 0               # discovered by the distance sensor
         self._dist_seen_value = None           # last front reading, and where the
         self._dist_seen_pose = None            # kart was when it first read it
+
+        # Live-maze bookkeeping for the self-retry loop. `_live_revision` ticks
+        # on every discovery and every un-discovery; a holding state compares it
+        # against the revision its last failed plan was computed from, so a real
+        # change retries instantly while an unchanged maze only retries on the
+        # timer.
+        self._live_revision = 0
+        self._planned_revision = -1
+        self._retry_at = 0.0
+        self._clear_looks = {}
 
         self._build_maze()
 
@@ -107,6 +127,7 @@ class LiveMazeRunner:
         # the boxes are already gone, so there is nothing to remove.
         self.view.clear_obstacles()
         self.obstacles_found = 0
+        self._forget_discoveries()
         self._replan_preview()
 
     def load_maze(self, maze_path: str) -> bool:
@@ -206,18 +227,14 @@ class LiveMazeRunner:
         return True
 
     def resume(self):
-        """Operator cleared the obstruction: forget what the distance sensor
-        learned -- the LIVE maze goes back to the .maze file's original -- and
-        replan from wherever the kart actually stopped, toward the same goal.
-        Anything still physically in the way is simply re-discovered on the
-        next approach, so this is safe to use liberally."""
+        """Forget EVERY discovery at once and replan from wherever the kart
+        actually stopped. The runner already un-discovers cells by itself as
+        the sensor sees them go clear, so this is no longer needed to get
+        moving again -- it is the manual override for when the operator knows
+        the whole live maze is stale (things moved somewhere the kart is not
+        looking) and would rather re-learn it from scratch than wait. Anything
+        still physically in the way is re-discovered on the next approach."""
         if self.phase != "live":
-            return
-        # "blocked" is a leg that came up short. But a discovery can also close
-        # the LAST route to the goal, which lands in "idle" -- and without this
-        # that is a dead end: the obstacles that closed the route could only be
-        # forgotten from "blocked", so nothing could ever reopen it.
-        if self.state != "blocked" and not (self.state == "idle" and self.view.obstacles):
             return
         self.clear_obstacles()
         self.replan_requested = True
@@ -228,12 +245,23 @@ class LiveMazeRunner:
         boxes come out of the Coppelia scene and MazeView restores its grid
         from the pristine copy it snapshotted at load."""
         for (r, c) in self.view.obstacles:
-            try:
-                cop.remove_object(self.sim, f"{self.maze_tag}_obs_{r}_{c}")
-            except Exception:                       # noqa: BLE001
-                pass                                # already gone -- fine
+            self._remove_obstacle_box((r, c))
         self.view.clear_obstacles()
         self.obstacles_found = 0
+        self._forget_discoveries()
+
+    def _forget_discoveries(self):
+        """Drop the per-cell evidence the live maze was built from and mark it
+        as changed, so any holding state re-plans against what is there now."""
+        self._clear_looks = {}
+        self._live_revision += 1
+
+    def _remove_obstacle_box(self, cell):
+        for_name = f"{self.maze_tag}_obs_{cell[0]}_{cell[1]}"
+        try:
+            cop.remove_object(self.sim, for_name)
+        except Exception:                           # noqa: BLE001
+            pass                                    # already gone -- fine
 
     # ---- camera (pan/tilt), valid in both phases ---------------------------
     def nudge(self, d_pan_deg: float, d_tilt_deg: float):
@@ -263,19 +291,26 @@ class LiveMazeRunner:
             path = solve_bfs(self.view, current_cell, self.goal_cell)
 
         self.replan_requested = False
+        self._planned_revision = self._live_revision
         if not path:
-            self.status = f"[ERROR] sem caminho a partir de {current_cell}"
+            # Not a dead end: _reconsider_live() keeps re-running this, so the
+            # moment the live maze opens up -- something taken off the floor,
+            # a cell un-discovered -- the run continues on its own.
             if self.view.obstacles:
-                # The live maze is what closed the route, so say so and point
-                # at the way out -- otherwise this reads as a dead end.
-                self.status += (f" ({len(self.view.obstacles)} obstaculo(s) detectado(s));"
-                                f" libere o caminho e digite 'resume'")
-            self.status += ". Ou escolha outro start/goal."
-            print(self.status)          # already carries its own [ERROR]
+                self.status = (f"[ESPERANDO] sem caminho a partir de {current_cell} "
+                               f"({len(self.view.obstacles)} obstaculo(s) detectado(s)). "
+                               f"Libere o caminho -- eu sigo sozinho.")
+            else:
+                self.status = (f"[ESPERANDO] sem caminho a partir de {current_cell}. "
+                               f"Escolha outro start/goal.")
+            if self.state != "waiting":
+                print(self.status)      # once per entry, not once per retry
             self.plan_path = [current_cell]
             self.plan_index = 0
-            self.state = "idle"
+            self.state = "waiting"
             return
+        if self.state in ("blocked", "waiting"):
+            print(f"[INFO] caminho reaberto a partir de {current_cell} -- seguindo")
         self.plan_path = path
         self.plan_index = 0
         self.state = "running"
@@ -301,26 +336,100 @@ class LiveMazeRunner:
         self._update_kart_view(wx, wy, wth)
 
         drive_tel = self.link.drive_telemetry()
-        # Runs even while blocked/idle -- a stopped run is exactly when you
-        # most want to learn what is actually in the way.
+        # Runs even while blocked/waiting -- a stopped run is exactly when you
+        # most want to learn what is actually in the way, and (now) when it
+        # stops being in the way.
         self._scan_obstacle(drive_tel, wx, wy, wth)
 
+        if self.state in ("blocked", "waiting"):
+            self._reconsider_live(wx, wy)
         if self.state != "running":
             return
         self._advance(drive_tel, wx, wy, wth)
 
-    def _scan_obstacle(self, drive_tel, wx, wy, wth):
-        """Front distance sensor -> LIVE maze. Anything closer than
-        OBSTACLE_DISTANCE_CM is projected onto the grid and that cell is
-        blocked, so the next replan routes around it. The .maze file's own
-        copy is never touched (see MazeView's original-vs-live split), so the
-        original stays the reference for what was there to begin with.
+    def _reconsider_live(self, wx, wy):
+        now = time.monotonic()
+        if self._live_revision == self._planned_revision and now < self._retry_at:
+            return
+        self._retry_at = now + LIVE_RETRY_INTERVAL_S
+        self._replan_live(self._nearest_cell(wx, wy))
 
-        The reading is projected rather than blindly blamed on the next cell:
-        it comes from the sensor, which sits SENSOR_FORWARD_OFFSET_M ahead of
-        the tracked center, so adding that back and walking the measured
-        distance along the current heading lands on whichever cell the
-        obstacle is really in -- one cell ahead or two."""
+    def _obstacle_scaned_is_valid(self,wx,wy,wth,cell) -> bool:
+        """Gate a projected hit before it is allowed to block a cell.
+
+        Every check here distrusts the PROJECTION, not the reading: the pose
+        drifts, and a hit that lands somewhere the sensor could not have seen
+        from means the pose was wrong -- not that the maze changed.
+
+        Order matters. mark_obstacle() mutates the live maze, so it has to be
+        the last thing that runs; anything checked after it would already have
+        blocked the cell it was meant to reject."""
+        # Cells lay in the maze
+        if not self.view.in_bounds(cell):
+            return False
+
+        origin = self._nearest_cell(wx, wy)
+        # Cell is not the one the kart is in, nor the current kart goal
+        if cell == origin or cell == self.goal_cell:
+            return False
+
+        # Origin Cell is an blocked wall
+        if self.view.is_wall(origin):
+            return False
+
+        # A ray from the Origin center to the Cell center must not cross an
+        # already Blocked/Wall Cell
+        if not self._has_line_of_sight(origin, cell):
+            return False
+
+        # Cell already a wall, or already discovered
+        return self.view.mark_obstacle(cell)
+
+    def _has_line_of_sight(self, src, dst) -> bool:
+        """Walk the straight line between two cell centers and report whether
+        it reaches `dst` without crossing a cell already known solid. The two
+        endpoints are skipped -- they are what the line connects, not things
+        standing in the way of it."""
+        dr = dst[0] - src[0]
+        dc = dst[1] - src[1]
+        # ~20 samples per cell crossed: fine enough to catch any cell the line
+        # genuinely passes through, coarse enough to ignore corner grazes that
+        # clip a wall by a hair on a diagonal.
+        steps = max(1, int(math.hypot(dr, dc) * 20))
+        for i in range(1, steps):
+            t = i / steps
+            mid = (round(src[0] + dr * t), round(src[1] + dc * t))
+            if mid == src or mid == dst:
+                continue
+            if self.view.is_wall(mid):
+                return False
+        return True
+
+    def _scan_obstacle(self, drive_tel, wx, wy, wth):
+        """Front distance sensor <-> LIVE maze, in BOTH directions.
+
+        A reading says two things and the run needs both. The far end is an
+        obstacle: whichever cell it falls in gets blocked, so the next replan
+        routes around it. Everything the beam passed THROUGH on the way there
+        is empty -- it would have stopped earlier otherwise -- so any cell in
+        that span previously discovered blocked gets un-discovered.
+
+        That second half is what makes the run live. Discoveries used to be
+        write-only, so a cell that closed the last route stayed closed until
+        somebody typed 'resume'. Now taking the box off the floor is enough:
+        the next sweep of that corridor reads long, the cell goes back to open,
+        and the planner finds the route it had lost.
+
+        The .maze file's own copy is never touched in either direction (see
+        MazeView's original-vs-live split), so the original stays the reference
+        for what was there to begin with -- and a wall that came from the file
+        is never something a reading gets to erase.
+
+        The hit is projected rather than blindly blamed on the next cell: it
+        comes from the sensor, which sits SENSOR_FORWARD_OFFSET_M ahead of the
+        tracked center, so adding that back and walking the measured distance
+        along the current heading lands on whichever cell the obstacle is
+        really in -- one cell ahead or two."""
         dist_cm = drive_tel.get("front_distance_cm")
         if dist_cm is None:
             return
@@ -328,19 +437,11 @@ class LiveMazeRunner:
             dist_cm = float(dist_cm)
         except (TypeError, ValueError):
             return
-        if dist_cm <= 0.0 or dist_cm > OBSTACLE_DISTANCE_CM:
+        if dist_cm <= 0.0:
             return
 
-        # Staleness: the kart reports `front_distance_cm` STICKILY -- the
-        # server only assigns it on a VALID read and (on an un-updated server)
-        # never clears it, and the RPi.GPIO sensor answers "out of range" with
-        # a 255 sentinel that gets dropped. So a clear road never refreshes the
-        # field and the last close reading can sit there forever, which would
-        # have us stamping phantom walls across every cell we then drive
-        # through. An identical reading that survives half a cell of travel is
-        # physically impossible for something this close, so treat it as
-        # frozen. (The server-side TTL is the real fix; this keeps the map
-        # honest until that is redeployed, and costs nothing after.)
+        # Frozen readings gate BOTH halves: a stuck sensor must not be allowed
+        # to erase obstacles any more than it is allowed to invent them.
         if dist_cm == self._dist_seen_value and self._dist_seen_pose is not None:
             px, py = self._dist_seen_pose
             if math.hypot(wx - px, wy - py) > SENSOR_FROZEN_TRAVEL_M:
@@ -349,22 +450,31 @@ class LiveMazeRunner:
             self._dist_seen_value = dist_cm
             self._dist_seen_pose = (wx, wy)
 
+        if dist_cm > OBSTACLE_DISTANCE_CM:
+            # Nothing within range, so the whole span out to the range limit is
+            # empty. Past that the reading is not a measurement of anything in
+            # particular, just "far", so it carves nothing.
+            self._carve_free(wx, wy, wth,
+                             SENSOR_FORWARD_OFFSET_M + OBSTACLE_DISTANCE_CM / 100.0,
+                             hit_cell=None)
+            return
+
         reach = SENSOR_FORWARD_OFFSET_M + dist_cm / 100.0
         hx = wx + math.cos(wth) * reach
         hy = wy + math.sin(wth) * reach
         rf, cf = cop.world_to_cell(self.origin, self.cell_length, hx, hy)
         cell = (round(rf), round(cf))
 
-        if not self.view.in_bounds(cell):
-            return
-        if cell == self._nearest_cell(wx, wy):
-            return                  # our own footprint -- too close to blame a cell
-        if cell == self.goal_cell:
-            return                  # never wall off the goal; that just bricks the run
-        if not self.view.mark_obstacle(cell):
-            return                  # already a wall, or already discovered
+        # Carve first: it only ever opens cells up, so the line-of-sight test
+        # below judges the hit against what the beam just proved
+        self._carve_free(wx, wy, wth, reach, hit_cell=cell)
 
-        self.obstacles_found += 1
+        if not self._obstacle_scaned_is_valid(wx,wy,wth,cell):
+            return
+
+        self._live_revision += 1
+        self.obstacles_found = len(self.view.obstacles)
+        self._clear_looks.pop(cell, None)
         print(f"[WARN] obstaculo detectado em {cell} ({dist_cm:.0f} cm) -- "
               f"maze ao vivo atualizado")
         try:
@@ -373,12 +483,63 @@ class LiveMazeRunner:
         except Exception as e:                      # noqa: BLE001
             print(f"[WARN] nao deu pra desenhar o obstaculo no Coppelia ({e})")
 
-        # Only worth re-routing if it actually sits on the plan. Left as a
-        # REQUEST, not an immediate replan: _advance() picks it up at the next
-        # cell boundary, so a leg in flight is never yanked mid-move -- and a
-        # blocked run stays blocked until the operator types 'resume'.
         if cell in self.plan_path:
             self.replan_requested = True
+
+    def _carve_free(self, wx, wy, wth, length, hit_cell):
+        """Un-discover the cells this reading just proved empty.
+
+        Walks outward from the kart along its heading, stopping at `hit_cell`
+        (where the beam STOPPED -- the opposite of empty) and at the first cell
+        the .maze file itself walls off, since nothing beyond that was measured.
+
+        A cell must read clear SENSOR_CLEAR_CONFIRMATIONS frames in a row before
+        it is actually dropped. Pose drift makes the projected ray wander by a
+        cell now and then, and one stray frame must not unblock something real
+        -- while an obstacle that is genuinely gone reads clear on every frame
+        and clears the bar in a fraction of a second."""
+        crossed = set()
+        for cell in self._cells_along(wx, wy, wth, length):
+            if cell == hit_cell or self.view.is_original_wall(cell):
+                break
+            crossed.add(cell)
+            if cell not in self.view.obstacles:
+                continue
+            looks = self._clear_looks.get(cell, 0) + 1
+            self._clear_looks[cell] = looks
+            if looks >= SENSOR_CLEAR_CONFIRMATIONS:
+                self._unmark_obstacle(cell)
+
+        # The streak has to be consecutive to mean anything, so a cell the beam
+        # is no longer crossing starts over instead of banking progress from
+        # the last time the kart happened to be pointed at it.
+        for cell in list(self._clear_looks):
+            if cell not in crossed:
+                del self._clear_looks[cell]
+
+    def _cells_along(self, wx, wy, wth, length):
+        """The cells a beam of `length` crosses, in order, kart outward."""
+        cx, cy = math.cos(wth), math.sin(wth)
+        steps = max(1, int(length / (self.cell_length * 0.25)))
+        out = []
+        for i in range(steps + 1):
+            t = length * i / steps
+            rf, cf = cop.world_to_cell(self.origin, self.cell_length,
+                                       wx + cx * t, wy + cy * t)
+            cell = (round(rf), round(cf))
+            if not out or out[-1] != cell:
+                out.append(cell)
+        return out
+
+    def _unmark_obstacle(self, cell):
+        """Drop one discovery from the live maze and the Coppelia scene."""
+        if not self.view.clear_obstacle(cell):
+            return
+        self._clear_looks.pop(cell, None)
+        self._live_revision += 1
+        self.obstacles_found = len(self.view.obstacles)
+        self._remove_obstacle_box(cell)
+        print(f"[INFO] {cell} livre de novo -- maze ao vivo atualizado")
 
     def _update_kart_view(self, wx, wy, wth):
         rf, cf = cop.world_to_cell(self.origin, self.cell_length, wx, wy)
@@ -413,11 +574,14 @@ class LiveMazeRunner:
             self.leg = None
             return
 
-        # "blocked"
+        # "blocked" -- a holding state, not a dead end: _reconsider_live() will
+        # keep re-planning, so this recovers by itself either way. A recorded
+        # obstacle gets routed around on the next try; one the sensor never saw
+        # (a stall, a slipped wheel) just gets retried until it goes.
         reason = "obstaculo a frente" if self.leg.guard_seen else "parou antes do previsto"
         self.status = (f"[INTERROMPIDO] {self.leg.from_cell} -> {self.leg.to_cell} "
                        f"({reason}, faltou {self.leg.shortfall:.2f} m). "
-                       f"Limpe o caminho e digite 'resume'.")
+                       f"Replanejando sozinho...")
         print(f"[WARN] {self.status}")
         self.state = "blocked"
         self.leg = None
@@ -436,6 +600,7 @@ class LiveMazeRunner:
             )
         color = {"running": styles.HUDColors.text,
                 "idle": styles.HUDColors.text_ok,
+                "waiting": styles.HUDColors.text_fail,
                 "blocked": styles.HUDColors.text_fail}.get(
             self.state, styles.HUDColors.text)
         second = ""
@@ -445,8 +610,8 @@ class LiveMazeRunner:
         if self.obstacles_found:
             second += f"   |  {self.obstacles_found} obstaculo(s) no maze ao vivo"
         third = "L-click novo start   R-click novo goal"
-        if self.state == "blocked":
-            third += "   digite 'resume' para tentar de novo"
+        if self.state in ("blocked", "waiting"):
+            third += "   (replanejando sozinho; 'resume' esquece tudo de uma vez)"
         return (
             (self.status, 18, color),
             video_line,
@@ -469,6 +634,7 @@ class LiveMazeRunner:
             self.kart_view.set_offset(px, py)
             self.kart_view.set_rotation(self._preview_heading)
             self.kart_view.render()
+        
         elif self.phase == "live" and self.last_world_pose is not None:
             self.kart_view.render()
 

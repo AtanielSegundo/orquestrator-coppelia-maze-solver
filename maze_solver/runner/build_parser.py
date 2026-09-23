@@ -8,8 +8,6 @@ from runner.constants import KART_HOST, KART_PORT, CONTROLS, HELP
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="coppelia_main.py",
-        description="Resolve o labirinto com o kart REAL (Lafvin PiKart), "
-                    "espelhado ao vivo no CoppeliaSim e nesta janela.",
         epilog=CONTROLS + HELP,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -23,11 +21,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="IP do Lafvin PiKart (default: %(default)s)")
     p.add_argument("--port", type=int, default=KART_PORT,
                    help="porta do web.py do kart (default: %(default)s)")
-    p.add_argument("--turn-speed", type=float, default=1.0,
+    p.add_argument("--turn-speed", type=float, default=0.2,
                    help="'speed' enviado no comando turn (default: %(default)s)")
+    p.add_argument("-cpd",
+                   "--coppelia_detach", 
+                   default=False,
+                   action="store_true",
+                   help="Flag para indicar desprender o coppelia do processo atual"
+                        "(default: %(default)s)")
     p.add_argument("--drive-speed", type=float, default=0.2,
-                   help="m/s enviado no comando drive_distance (default: %(default)s)")
-    p.add_argument("--video", choices=("sim", "client", "off"), default="sim",
-                   help="quem puxa o stream da camera -- ver camera_link/ "
-                       "(default: %(default)s)")
+                       help="m/s enviado no comando drive_distance"
+                            "(default: %(default)s)")
+        
+    p.add_argument("--video", choices=("sim", "client", "off"), 
+                   default="sim",
+                   help="stream producer -- ver camera_link/ "
+                        "(default: %(default)s)")
     return p
