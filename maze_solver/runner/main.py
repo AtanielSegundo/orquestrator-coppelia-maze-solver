@@ -97,7 +97,13 @@ def main():
 
     CAM_SPEED = 60.0    # %/s of pan/tilt travel while an arrow key is held (0-100 range)
     K = pr.KeyboardKey
-
+    #! IF PRESSED ALL KEYS PRESSED WHILE GUI IS FOCUSED AND UNTIL "\n"
+    #! IS CAPTURED AND SENDED TO commands
+    TRACK_GUI_KEYBOARD_SYMBOL = ":"
+    TRACK_GUI_KEYBOARD_CODE   = ord(TRACK_GUI_KEYBOARD_SYMBOL)
+    track_gui_keys_mode = False
+    tracked_keys_str    = ""
+    
     running = True
     try:
         while running and not pr.window_should_close():
@@ -140,16 +146,52 @@ def main():
             # ---------- keyboard: arrow keys -> camera pan/tilt ----------
             cam_step = CAM_SPEED * dt
             d_pan = d_tilt = 0.0
+            
+            if track_gui_keys_mode:
+                # control keys (key queue)
+                while (_code := pr.get_key_pressed()) != 0:
+                    if _code in (K.KEY_ENTER, K.KEY_KP_ENTER):
+                        _split = tracked_keys_str.split()
+                        if _split:
+                            commands.put((_split[0].lower(), _split[1:]))
+                        track_gui_keys_mode = False
+                        tracked_keys_str = ""
+                    
+                    elif _code == K.KEY_BACKSPACE:
+                        tracked_keys_str = tracked_keys_str[:-1]
+                    
+                    elif _code == K.KEY_ESCAPE:
+                        track_gui_keys_mode = False
+                        tracked_keys_str = ""
+                        
+                # text (char queue: respects shift/layout)
+                while (_cp := pr.get_char_pressed()) != 0:
+                    if track_gui_keys_mode:
+                        tracked_keys_str += chr(_cp)
+            else:
+                while (_cp := pr.get_char_pressed()) != 0:
+                    if chr(_cp) == TRACK_GUI_KEYBOARD_SYMBOL:
+                        track_gui_keys_mode = True
+                
             if pr.is_key_down(K.KEY_LEFT):  d_pan  += cam_step
+            
             if pr.is_key_down(K.KEY_RIGHT): d_pan  -= cam_step
-            if pr.is_key_down(K.KEY_UP):    d_tilt += cam_step
-            if pr.is_key_down(K.KEY_DOWN):  d_tilt -= cam_step
-            if pr.is_key_pressed(K.KEY_C):  runner.look_forward()
+            
+            if pr.is_key_down(K.KEY_UP):    
+                if pr.is_key_down(K.KEY_LEFT_CONTROL):
+                    runner.look_forward()
+                else:
+                    d_tilt += cam_step
+            
+            if pr.is_key_down(K.KEY_DOWN):  
+                d_tilt -= cam_step
+                
             if d_pan or d_tilt:
                 runner.nudge(d_pan, d_tilt)
 
             runner.step(dt)
-            runner.render()
+            runner.render(track_gui_keys_mode,tracked_keys_str)
+            
     except KeyboardInterrupt:
         pass
     finally:

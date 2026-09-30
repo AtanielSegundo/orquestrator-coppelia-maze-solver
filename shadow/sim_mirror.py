@@ -63,6 +63,24 @@ class SimMirror:
 
         self._wheel_angle = 0.0
 
+    def shift_anchor(self, dx: float, dy: float) -> None:
+        """Translate the anchor by (dx, dy) in the WORLD frame.
+
+        `world_pose()` is compose(initial, rel), and compose applies `initial`'s
+        rotation to `rel` before adding `initial`'s translation -- so moving the
+        anchor's translation moves every pose it produces by exactly the same
+        world vector, leaving heading and all relative motion untouched.
+
+        This is how the 1-D range correction lands (see runner/range_fix.py).
+        Correcting the ANCHOR rather than patching each pose is what makes the
+        fix persistent: the statement being made is "our guess of where the kart
+        started was off by this much", which stays true for every later odometry
+        sample. Patching the output pose would be undone by the next telemetry
+        frame, since that frame recomputes it from the unchanged anchor.
+        """
+        x0, y0, th0 = self.initial
+        self.initial = (x0 + dx, y0 + dy, th0)
+
     def world_pose(self, odom_pose, odom_ref):
         """Odom telemetry pose -> world (x, y, theta) of the kart's CENTER,
         relative to the first odom sample (odom_ref) and anchored to the

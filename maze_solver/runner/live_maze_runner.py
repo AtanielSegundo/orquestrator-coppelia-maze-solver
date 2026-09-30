@@ -19,6 +19,8 @@ from runner.constants import (
     SENSOR_FORWARD_OFFSET_M, SENSOR_FROZEN_TRAVEL_M,
 )
 from runner.leg import Leg
+from runner.range_fix import RangeFix
+from runner.recenter import Recenter
 
 
 class LiveMazeRunner:
@@ -92,6 +94,8 @@ class LiveMazeRunner:
         self.obstacles_found = 0               # discovered by the distance sensor
         self._dist_seen_value = None           # last front reading, and where the
         self._dist_seen_pose = None            # kart was when it first read it
+        self._last_slip = {}                   # kart's slip sub-dict, for the HUD
+        self.recenter: Optional[Recenter] = None   # physical recentring in flight
 
         # Live-maze bookkeeping for the self-retry loop. `_live_revision` ticks
         # on every discovery and every un-discovery; a holding state compares it
@@ -114,6 +118,9 @@ class LiveMazeRunner:
                                     cell_cube_size=self.cell_length,
                                     wall_color=CAIXA_COR)
         self.origin = origin
+        # 1-D longitudinal pose correction, rebuilt with the maze because it
+        # raycasts against this maze's walls and origin.
+        self.range_fix = RangeFix(self.view, origin, self.cell_length)
         margin = 2 * self.cell_length
         cop.change_floor(self.sim,
                          (self.view.cols * self.cell_length + margin,
@@ -336,6 +343,9 @@ class LiveMazeRunner:
         self._update_kart_view(wx, wy, wth)
 
         drive_tel = self.link.drive_telemetry()
+        # Cached for the HUD, and consulted by both the obstacle scan and the
+        # range fix. Empty against a kart whose server predates the detector.
+        self._last_slip = drive_tel.get("slip") or {}
         # Runs even while blocked/waiting -- a stopped run is exactly when you
         # most want to learn what is actually in the way, and (now) when it
         # stops being in the way.
@@ -429,7 +439,18 @@ class LiveMazeRunner:
         comes from the sensor, which sits SENSOR_FORWARD_OFFSET_M ahead of the
         tracked center, so adding that back and walking the measured distance
         along the current heading lands on whichever cell the obstacle is
-        really in -- one cell ahead or two."""
+        really in -- one cell ahead or two.
+
+        Suspended while the kart reports slipping. The reading itself is fine
+        -- the ultrasonic does not care what the wheels are doing -- but the
+        POSE it gets projected through was integrated from those slipping
+        wheels, so the hit lands in the wrong cell. Writing that into the live
+        maze is worse than writing nothing: it blocks a cell that is actually
+        clear, and the un-discovery path then has to walk it back over
+        SENSOR_CLEAR_CONFIRMATIONS frames. Carving free is suspended for the
+        same reason -- a mislocated beam would erase a real obstacle."""
+        if self._last_slip.get("slipping"):
+            return
         dist_cm = drive_tel.get("front_distance_cm")
         if dist_cm is None:
             return
@@ -541,6 +562,91 @@ class LiveMazeRunner:
         self._remove_obstacle_box(cell)
         print(f"[INFO] {cell} livre de novo -- maze ao vivo atualizado")
 
+    def _start_recenter(self, wx, wy, wth):
+        """Begin a physical recentring session at a cell boundary.
+
+        The pose is passed in because the session FREEZES its target range from
+        it -- a target recomputed from the moving belief would retreat exactly
+        as fast as the kart advanced. See runner/recenter.py.
+        """
+        self.recenter = Recenter(self.range_fix, self.link, wx, wy, wth)
+
+    def _poll_recenter(self, drive_tel, wx, wy, wth):
+        """Drive the session forward one frame.
+
+        On success the kart now sits where the belief already said it was, so
+        nothing further is needed -- the two were reconciled by moving the kart
+        rather than by editing the pose.
+
+        On "giveup" the kart could not be moved there, so the estimated anchor
+        correction is applied instead. That fallback matters: a kart that
+        physically cannot close the gap (wheels against a wall, a surface it
+        cannot grip) would otherwise keep both a wrong pose AND a wrong
+        position. Moving the belief is always available, even when moving the
+        kart is not.
+        """
+        outcome = self.recenter.poll(drive_tel)
+        if outcome == "pending":
+            self.status = f"recentrando: {self.recenter.status}"
+            return
+
+        summary = self.recenter.summary()
+        if outcome == "giveup":
+            print(f"[WARN] recentragem: {summary} -- corrigindo so a crenca")
+            self._apply_range_fix(drive_tel, wx, wy, wth)
+        elif self.recenter.moved():
+            print(f"[INFO] recentragem: {summary}")
+
+        self.recenter = None
+
+    def _apply_range_fix(self, drive_tel, wx, wy, wth):
+        """Pull the believed pose along its heading to match what the front
+        sensor sees, when the map predicts a wall the beam should be hitting.
+
+        This is the only correction to TRANSLATION anywhere in the stack.
+        Heading is already ground truth (the kart closes it on the MPU6050
+        gyro), but `d_center` comes from the encoders alone, so wheel slip
+        accumulates in x/y without bound -- nothing else observes it.
+
+        Only the longitudinal component is touched. One range reading observes
+        one degree of freedom, and pointed down a corridor that DOF is the
+        distance to the wall ahead; it says nothing about lateral offset within
+        the corridor. So the correction is applied strictly along the heading.
+        Recovering the lateral DOF needs a multi-heading profile (rotate,
+        sample, repeat), which is a separate and much larger feature.
+
+        Skipped while `slip.slipping` is set: the reading would be compared
+        against a pose integrated from the very wheels that are slipping, so
+        the residual would mix the error being measured with the error being
+        corrected.
+        """
+        if self.mirror is None:
+            return
+        slip = drive_tel.get("slip") or {}
+        correction = self.range_fix.evaluate(
+            wx, wy, wth, drive_tel.get("front_distance_cm"),
+            slipping=bool(slip.get("slipping")))
+        if correction is None:
+            return
+
+        # `correction` is already signed to be ADDED along the heading (moving
+        # forward shortens the predicted range, so it comes out as -residual --
+        # see range_fix's module docstring).
+        dx = math.cos(wth) * correction
+        dy = math.sin(wth) * correction
+        self.mirror.shift_anchor(dx, dy)
+        print(f"[INFO] range-fix: {correction:+.3f} m "
+              f"(previsto {self.range_fix.last_predicted_m:.2f} m, "
+              f"medido {self.range_fix.last_measured_m:.2f} m)")
+
+        # Re-place both views immediately, so the jump happens visibly at the
+        # cell boundary instead of appearing as an unexplained discontinuity on
+        # the next telemetry frame.
+        cx, cy = wx + dx, wy + dy
+        self.mirror.apply_world_pose(cx, cy, wth)
+        self.last_world_pose = (cx, cy, wth)
+        self._update_kart_view(cx, cy, wth)
+
     def _update_kart_view(self, wx, wy, wth):
         rf, cf = cop.world_to_cell(self.origin, self.cell_length, wx, wy)
         px, py = self.view.center_f(rf, cf)
@@ -548,6 +654,13 @@ class LiveMazeRunner:
         self.kart_view.set_rotation(world_theta_to_grid_heading(wth))
 
     def _advance(self, drive_tel, wx, wy, wth):
+        # A recentring session owns the kart while it runs: it is issuing its
+        # own drive_distance commands, so the next leg must not be started on
+        # top of them. Checked before anything else for that reason.
+        if self.recenter is not None:
+            self._poll_recenter(drive_tel, wx, wy, wth)
+            return
+
         if self.leg is None:
             if self.replan_requested:
                 self._replan_live(self._nearest_cell(wx, wy))
@@ -568,10 +681,15 @@ class LiveMazeRunner:
         outcome = self.leg.poll(self.link, drive_tel, wx, wy)
         if outcome == "pending":
             return
+        
         if outcome == "arrived":
             self.visited.append(self.leg.to_cell)
             self.plan_index += 1
             self.leg = None
+            # Recentre HERE, between legs: the kart is stationary, the odometry
+            # has settled, and the next leg is only built once this finishes --
+            # so it starts from the corrected position.
+            self._start_recenter(wx, wy, wth)
             return
 
         # "blocked" -- a holding state, not a dead end: _reconsider_live() will
@@ -592,12 +710,12 @@ class LiveMazeRunner:
                       f"cam pan={self.camera.pan_pct}% tilt={self.camera.tilt_pct}%   "
                       f"(arrows=cam, C=centraliza)", 14, styles.HUDColors.text_dim)
         if self.phase == "setup":
-            return (
+            return [
                 (self.status, 18, styles.HUDColors.text),
                 video_line,
                 ("L-click start   R-click goal   digite 'ok' quando o kart "
                  "REAL estiver posicionado", 16, styles.HUDColors.text_dim),
-            )
+            ]
         color = {"running": styles.HUDColors.text,
                 "idle": styles.HUDColors.text_ok,
                 "waiting": styles.HUDColors.text_fail,
@@ -612,14 +730,31 @@ class LiveMazeRunner:
         third = "L-click novo start   R-click novo goal"
         if self.state in ("blocked", "waiting"):
             third += "   (replanejando sozinho; 'resume' esquece tudo de uma vez)"
-        return (
+
+        # The range fix moves the kart's believed position on its own. Showing
+        # what it did -- and, just as importantly, why it declined -- keeps it
+        # from being an invisible process nudging the pose behind the operator's
+        # back. Slip is on the same line because it is the main reason the fix
+        # holds off.
+        if self.recenter is not None:
+            fix_line = f"recentrando: {self.recenter.status}"
+        else:
+            fix_line = self.range_fix.status_line()
+        if self._last_slip.get("slipping"):
+            fix_line += (f"   |  DERRAPANDO "
+                         f"(res {self._last_slip.get('residual_dps', 0):+.0f} deg/s)")
+        elif self._last_slip.get("events"):
+            fix_line += f"   |  {self._last_slip['events']} derrapagem(ns)"
+
+        return [
             (self.status, 18, color),
             video_line,
             (second, 16, styles.HUDColors.text_dim),
+            (fix_line, 14, styles.HUDColors.text_dim),
             (third, 16, styles.HUDColors.panel_line),
-        )
+        ]
 
-    def render(self):
+    def render(self,track_gui_keys=False,track_guys_str=None):
         pr.begin_drawing()
         pr.clear_background(styles.HUDColors.background)
 
@@ -638,7 +773,16 @@ class LiveMazeRunner:
         elif self.phase == "live" and self.last_world_pose is not None:
             self.kart_view.render()
 
-        self.hud.render(self.hud_lines())
+        _hud_lines = self.hud_lines()
+        # _hud_lines.append((" "*10,10,pr.WHITE))
+        _fmt_str = "Command: "
+        if track_gui_keys:
+            _fmt_str += track_guys_str
+            
+        _fmt_current_cmd = (_fmt_str,22,pr.WHITE)
+        _hud_lines.append(_fmt_current_cmd)
+        self.hud.render(_hud_lines)
+        
         pr.end_drawing()
 
     def stop(self):
