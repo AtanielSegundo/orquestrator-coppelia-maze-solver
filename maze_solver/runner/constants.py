@@ -136,10 +136,22 @@ RANGE_FIX_MAX_PREDICTED_M = 1.20
 # enough that the echo almost certainly came from what the ray points at.
 #
 # It also caps the damage from heading error: at 12 degrees off-axis (the
-# alignment tolerance) a 0.30 m reading is off by 0.30*(1/cos(12deg)-1) ~= 7 mm,
+# alignment tolerance) a 0.45 m reading is off by 0.45*(1/cos(12deg)-1) ~= 10 mm,
 # while at 1.20 m the same angle costs ~27 mm -- more than the whole drift
 # being corrected.
-RANGE_FIX_MAX_TRUSTED_M = 0.30
+#
+# Sized against the cell geometry, which is what makes 0.45 the useful value
+# here rather than 0.30. With 0.25 m cells and the sensor 0.13 m ahead of the
+# tracked centre, the wall the beam can actually see sits at:
+#
+#     2 cells ahead:  2*0.25 - 0.125 - 0.13 = 0.245 m
+#     3 cells ahead:  3*0.25 - 0.125 - 0.13 = 0.495 m
+#
+# A 0.30 ceiling therefore only ever admitted the 2-cell case, and with barely
+# 5 cm of headroom before an offset kart's reading fell outside it. 0.45 keeps
+# the 2-cell wall comfortably inside and still excludes the 3-cell one, where
+# heading error starts to dominate the residual.
+RANGE_FIX_MAX_TRUSTED_M = 0.45
 
 # Residual smaller than this is sensor quantisation, not drift: the kart
 # reports whole centimetres, so +-1 cm carries no information.
@@ -195,3 +207,4 @@ RECENTER_SETTLE_S = 0.35
 # Leg's START_GRACE_S, and for the same reason: the first frame after a command
 # can still be a sample from before the server processed it.
 RECENTER_START_GRACE_S = 0.4
+

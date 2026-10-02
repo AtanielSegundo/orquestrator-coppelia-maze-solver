@@ -143,10 +143,10 @@ class LiveMazeRunner:
             return False
         if not self.view.set_maze(maze_path):
             return False
-        self.maze_path = maze_path
+        self.maze_path  = maze_path
         self.start_cell = self.view.start
-        self.goal_cell = self.view.goal
-        self.waypoint = None
+        self.goal_cell  = self.view.goal
+        self.waypoint   = None
         self._build_maze()
         return True
 
@@ -355,6 +355,7 @@ class LiveMazeRunner:
             self._reconsider_live(wx, wy)
         if self.state != "running":
             return
+        
         self._advance(drive_tel, wx, wy, wth)
 
     def _reconsider_live(self, wx, wy):
@@ -653,6 +654,37 @@ class LiveMazeRunner:
         self.kart_view.set_offset(px, py)
         self.kart_view.set_rotation(world_theta_to_grid_heading(wth))
 
+    def _leg_target(self, to_cell):
+        """The absolute destination for a leg ending on `to_cell`, in the two
+        frames `Leg` needs it in: (world_xy, odom_xyth_deg).
+
+        The world pair is the cell's exact center (`cell_to_world` of an integer
+        cell IS the center -- see its docstring and `world_to_cell`, its exact
+        inverse). The odom triple is that same point expressed in the kart's
+        odometry frame, which is the only frame the kart's `goto` understands.
+
+        Recomputed per leg rather than cached with the plan, because the
+        transform depends on `mirror.initial`, and `range_fix` moves that
+        anchor mid-run (`shift_anchor`). A target converted once, before a
+        correction landed, would aim at where the cell center USED to be
+        believed to be -- quietly re-introducing exactly the error the
+        correction just removed.
+
+        Returns (None, None) when the conversion is not available yet (no
+        telemetry reference), which makes `Leg` fall back to the relative
+        turn-then-drive hop rather than aim at an unknown point.
+        """
+        tx, ty, _ = cop.cell_to_world(self.origin, self.cell_length, to_cell)
+        if self.mirror is None or self.odom_ref is None:
+            return None, None
+        # The heading is commanded too: goto's third phase settles it gyro-
+        # closed when a gyro is present, which beats this side's open-loop
+        # turn chunks at the same job.
+        heading = heading_between(self.plan_path[self.plan_index], to_cell)
+        wth_target = grid_heading_to_world_theta(heading)
+        ox, oy, oth = self.mirror.odom_target(self.odom_ref, tx, ty, wth_target)
+        return (tx, ty), (ox, oy, oth)
+
     def _advance(self, drive_tel, wx, wy, wth):
         # A recentring session owns the kart while it runs: it is issuing its
         # own drive_distance commands, so the next leg must not be started on
@@ -673,9 +705,15 @@ class LiveMazeRunner:
                 return
             frm = self.plan_path[self.plan_index]
             to = self.plan_path[self.plan_index + 1]
+
+            target_world, odom_target = self._leg_target(to)
             self.leg = Leg(frm, to, wth, self.cell_length,
-                           self.turn_speed, self.drive_speed)
+                           self.turn_speed, self.drive_speed,
+                           target_world=target_world,
+                           odom_target=odom_target)
+
             self.status = f"{frm} -> {to}"
+
             return
 
         outcome = self.leg.poll(self.link, drive_tel, wx, wy)

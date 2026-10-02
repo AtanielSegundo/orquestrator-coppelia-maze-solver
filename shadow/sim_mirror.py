@@ -91,6 +91,30 @@ class SimMirror:
         rel = compose(inverse(odom_ref), odom_pose)      # motion since we started
         return compose(self.initial, rel)                # into the sim world frame
 
+    def odom_target(self, odom_ref, wx, wy, wtheta=None):
+        """WORLD pose of the kart's center -> the pose to hand `KartLink.goto`.
+
+        The exact inverse of `world_pose`: that one is
+        compose(initial, compose(inverse(odom_ref), odom_pose)), so going back
+        is compose(odom_ref, compose(inverse(initial), world)). `odom_ref` has
+        to be the same first-sample reference the forward direction uses, which
+        is why it is an argument rather than state here.
+
+        Why this exists at all: the kart's `goto` closes its loop on odometry,
+        in the odom frame, while every maze target is a world-frame cell center.
+        Sending world coordinates to `goto` is not an approximation, it is a
+        different destination -- and the error is not even constant, because
+        `shift_anchor` moves `initial` whenever the range fix fires. So the
+        transform is recomputed from the live `initial` on every call and never
+        cached.
+
+        Returns (x, y, theta_deg) with theta in DEGREES, ready for `goto`'s
+        wire format, or theta None when `wtheta` is None.
+        """
+        inv = compose(inverse(self.initial), (wx, wy, wtheta or 0.0))
+        ox, oy, oth = compose(odom_ref, inv)
+        return ox, oy, (None if wtheta is None else math.degrees(oth))
+
     def apply_world_pose(self, wx, wy, wtheta):
         """(wx, wy, wtheta): world pose of the kart's CENTER. Converts back to
         where the object's own origin must sit for the center to land there

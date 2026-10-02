@@ -73,6 +73,25 @@ class KartLink:
         self.send_command({"type": "drive_distance",
                            "distance": distance_m, "speed": speed})
 
+    def goto(self, x, y, theta_deg=None):
+        """Absolute go-to-pose in the kart's ODOMETRY frame (m, deg) -- see
+        DriveController.goto_pose, which runs it as turn -> drive -> turn with
+        every phase recomputed from the live odom pose.
+
+        ODOMETRY frame, not the sim world frame: the odom origin is wherever
+        `reset_odometry` was last called. Converting a world target into this
+        frame is SimMirror.odom_target()'s job -- passing world coordinates
+        straight through would drive the kart to the wrong place entirely
+        (the two frames only coincide for a kart started at the world origin
+        facing +X, with no anchor correction ever applied).
+
+        `theta_deg` None leaves the final heading wherever the drive ends.
+        """
+        msg = {"type": "goto", "x": float(x), "y": float(y)}
+        if theta_deg is not None:
+            msg["theta"] = float(theta_deg)
+        self.send_command(msg)
+
     # -- main-thread API: reading state --------------------------------------
     def latest(self):
         """(pose, wheel_speed) -- kept for callers that only care about those."""

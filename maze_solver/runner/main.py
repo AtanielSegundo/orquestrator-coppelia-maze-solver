@@ -84,8 +84,8 @@ def main():
         kart_view.set_scale_to_pixels(view.cell * (args.kart_lenght / args.cell_lenght))
     rescale()
 
-    ws_url = f"ws://{args.host}:{args.port}/ws"
-    video_url = f"http://{args.host}:{args.port}/video"
+    ws_url      = f"ws://{args.host}:{args.port}/ws"
+    video_url   = f"http://{args.host}:{args.port}/video"
     command_url = f"http://{args.host}:{args.port}/command"
     runner = LiveMazeRunner(sim, kart_base, motors, maze_path, view, kart_view,
                             args.cell_lenght, ws_url,
@@ -136,6 +136,7 @@ def main():
                 cell = view.mouse_cell()
                 if cell and not runner.set_start(cell):
                     print(f"[ERROR] {cell} e parede ou e o goal atual")
+            
             if pr.is_mouse_button_pressed(pr.MOUSE_BUTTON_RIGHT):
                 cell = view.mouse_cell()
                 if cell and not runner.set_goal(cell):
@@ -173,9 +174,11 @@ def main():
                     if chr(_cp) == TRACK_GUI_KEYBOARD_SYMBOL:
                         track_gui_keys_mode = True
                 
-            if pr.is_key_down(K.KEY_LEFT):  d_pan  += cam_step
+            if pr.is_key_down(K.KEY_LEFT):  
+                d_pan  += cam_step
             
-            if pr.is_key_down(K.KEY_RIGHT): d_pan  -= cam_step
+            if pr.is_key_down(K.KEY_RIGHT): 
+                d_pan  -= cam_step
             
             if pr.is_key_down(K.KEY_UP):    
                 if pr.is_key_down(K.KEY_LEFT_CONTROL):
