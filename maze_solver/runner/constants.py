@@ -208,3 +208,237 @@ RECENTER_SETTLE_S = 0.35
 # can still be a sample from before the server processed it.
 RECENTER_START_GRACE_S = 0.4
 
+
+# ---------------------------------------------------------------------------
+# Angular sweep + 2-DOF pose fit (runner/scan_fit.py, runner/sweep.py)
+#
+# range_fix and Recenter both close the LONGITUDINAL axis against a single
+# forward ray. That ray cannot observe lateral offset at all -- and lateral is
+# the component that actually puts the kart into a wall, since a corridor is
+# only one cell wide. Readings taken at several HEADINGS do see it: the profile
+# of range-versus-angle shifts when the kart moves sideways, which no single
+# reading can show.
+#
+# Every number below was measured against tcc.maze (6x10, 0.30 m cells) with
+# 1 cm sensor noise and whole-centimetre quantisation, over the solved path.
+# ---------------------------------------------------------------------------
+# Half-span of the sweep, and the step between samples.
+#
+# The span is set by how many samples survive, not by taste. Measured on
+# tcc.maze's solved path -- mean usable samples per cell, and cells that reach
+# SCAN_FIT_MIN_SAMPLES (of 17):
+#
+#     +-45 / 15 deg -> 2.5 samples/cell,  7 of 17 usable
+#     +-60 / 15 deg -> 3.9 samples/cell,  9 of 17 usable
+#     +-75 / 15 deg -> 4.9 samples/cell, 14 of 17 usable
+#     +-90 / 15 deg -> 5.9 samples/cell, 14 of 17 usable
+#
+# +-75 is where the yield stops improving for free: it costs the same 11
+# rotations as +-60 at this step and reaches 14 cells instead of 9, while +-90
+# adds two more rotations for no extra cells. Accuracy is unchanged by the
+# wider span (both +-60 and +-75 measure 0.00 cm median / 0.50 cm p90 lateral
+# error with 1 cm sensor noise, zero gross failures), so the wider one is
+# strictly better here.
+#
+# Note what the outermost samples are worth on real hardware, though: at 0.30 m
+# cells a side wall 0.15 m away subtends 2.5 cm of range at 75 deg, inside the
+# HC-SR04's blind zone (SENSOR_MIN_RANGE_CM), and ultrasonic echo off a flat
+# wall is largely specular past ~15 deg of incidence. The simulation's ideal
+# raycasts are optimistic about those angles; if the bench shows the wide
+# samples returning nothing, drop back to +-60 and expect the lower yield
+# rather than chasing it with a finer step.
+#
+# 15 deg steps over 10: finer steps do raise the count (7.6/cell at +-75/10,
+# 15 of 17 cells) but at 31 rotations per sweep instead of 11, and each rotation
+# is an open-loop turn whose own error enters the fit through the sample's
+# recorded heading.
+SWEEP_HALF_SPAN_DEG = 75.0
+SWEEP_STEP_DEG = 15.0
+
+# Skip a side the map says is open: a sample that predicts no wall is dropped
+# by the fit anyway (scan_fit._residuals), so sweeping into open space spends
+# rotations for nothing. A side counts as worth sweeping if the map predicts a
+# wall within this range on that side.
+SWEEP_SIDE_PROBE_M = 0.45
+
+# Pause after each rotation before reading. Same reasoning as
+# RECENTER_SETTLE_S: an ultrasonic reading taken while the chassis is still
+# rocking is noise, and here it would be noise fed straight into a least-
+# squares fit that assumes the pose was static.
+SWEEP_SETTLE_S = 0.30
+
+# Readings averaged at each angle. The sensor quantises to whole centimetres
+# and the fit is trying to resolve a few millimetres, so averaging a handful of
+# samples at one heading recovers resolution the single reading throws away.
+SWEEP_SAMPLES_PER_ANGLE = 3
+
+# Max wait for `goal_active` after a sweep rotation -- same stale-telemetry
+# guard as Leg.START_GRACE_S and RECENTER_START_GRACE_S.
+SWEEP_START_GRACE_S = 0.4
+
+# Minimum interval between sweeps, in legs -- a FLOOR, not a target. 1 means
+# "every boundary that has geometry to measure against", which is what keeping
+# the kart off the walls actually requires.
+#
+# This was 3, on the reasoning that the absolute goto had made lateral drift
+# slow. That reasoning was wrong, and the measurement says so. `goto` closes its
+# loop on ODOMETRY, so it cannot see a heading error: if the kart turns 2 degrees
+# more than commanded, odometry records the commanded heading, the belief and
+# the target agree perfectly, and goto reports success while the real kart walks
+# off at an angle. Worst real position error over tcc.maze's 17-cell path, with
+# per-rotation heading error, relative legs vs absolute goto:
+#
+#     1 deg/turn ->  3.8 cm both      3 deg/turn -> 11.3 cm both
+#     2 deg/turn ->  7.6 cm both      5 deg/turn -> 18.9 cm both
+#
+# Identical. Against heading error the goto buys nothing, because each 30 cm leg
+# displaces sin(err)*0.30 sideways (0.52 cm per degree) and nothing proprioceptive
+# observes it. Only an exteroceptive measurement does -- the sweep.
+#
+# Worst error with the sweep, by interval (clearance to a wall is 15 cm minus
+# half the kart, about 8 cm):
+#
+#     interval   2 deg    3 deg    5 deg
+#     never      7.6 cm  11.3 cm  18.9 cm
+#     every 3    5.4 cm   8.1 cm  13.1 cm   <- still hits at 3 deg
+#     every 1    3.1 cm   7.2 cm   7.5 cm   <- holds to 5 deg
+#
+# Hence 1. The cost is bounded by the geometry gate in
+# LiveMazeRunner._sweep_worth_trying, which skips boundaries where the map
+# foresees too little to fit: 13 attempts instead of 16 on this path, for the
+# same accuracy as sweeping unconditionally.
+#
+# Do not "optimise" this back to an every-N cadence. Measured, a cadence of 2
+# was WORSE than 3 (12.8 cm vs 4.8 cm) because of which cells the count lands
+# on -- the result aliases against the maze layout, so the knob is not
+# monotonic and tuning it is tuning noise.
+SWEEP_EVERY_N_LEGS = 1
+
+# ---------------------------------------------------------------------------
+# The fit itself (runner/scan_fit.py)
+# ---------------------------------------------------------------------------
+# Half-width of the (dx, dy) search window. Just over half a cell: a genuine
+# error larger than this is a lost pose rather than drift, and a wider window
+# mostly lets the search find a convincing wrong answer against the next cell's
+# walls.
+SCAN_FIT_MAX_SHIFT_M = 0.12
+
+# Two-pass grid: coarse over the window, then fine around the winner. The
+# product is ~250 candidate positions and a few hundred raycasts each -- tens
+# of milliseconds, which is why the sweep runs the fit on a worker thread
+# rather than inline (see runner/sweep.py).
+SCAN_FIT_COARSE_STEP_M = 0.03
+SCAN_FIT_FINE_STEP_M = 0.005
+
+# Fewest samples that may produce a fit. Two readings at distinct headings are
+# the formal minimum for 2 DOF; 4 is where the measured error stops having a
+# tail. On tcc.maze with 1 cm noise, median lateral error and the rate of
+# gross (>3 cm) failures:
+#
+#     min 3 -> 0.27 cm median,  5 gross in 494 fits
+#     min 4 -> 0.25 cm median,  0 gross in 289 fits
+#
+# The cost of the higher bar is fits refused, not fits made badly, and a
+# refused fit leaves the belief alone -- the safe direction.
+SCAN_FIT_MIN_SAMPLES = 4
+
+# Fraction of the worst residuals dropped before summing. ZERO, deliberately,
+# and this one is counter-intuitive enough to be worth the measurement.
+#
+# Trimming is the right instinct with many samples: one reading through an
+# opening the map does not model is off by a whole cell, and squaring makes it
+# worth hundreds of good ones. But a sweep yields ~4 samples, and a 2-DOF fit
+# needs 2 -- so dropping 25% of four samples throws away one of the readings
+# that was pinning the answer, leaving the fit underdetermined and free to
+# slide. Measured on tcc.maze, 1 cm noise, p90 of the lateral error and gross
+# failures out of 289 fits:
+#
+#     trim 0.00 -> p90 0.82 cm,   0 gross
+#     trim 0.15 -> p90 1.27 cm,  19 gross
+#     trim 0.25 -> p90 8.68 cm,  42 gross
+#
+# An 8.68 cm p90 error is worse than the drift being corrected. Robustness
+# here comes from SCAN_FIT_MIN_SAMPLES and the observability gate instead; if
+# the sweep is ever made dense enough to have samples to spare, revisit this
+# with the same measurement.
+SCAN_FIT_TRIM_FRACTION = 0.0
+
+# ---------------------------------------------------------------------------
+# Observability gate (runner/scan_fit.py: longitudinal_is_observable)
+#
+# In a straight corridor with no wall ahead in range, longitudinal position is
+# UNOBSERVABLE: the side walls look identical wherever the kart sits along
+# them. Measured directly -- the trimmed cost is exactly 0.0 across the whole
+# +-16 cm window, so the fit's longitudinal number is whatever the search
+# happened to touch first. On tcc.maze's open cells it came out at -16 to
+# -18 cm against a true +2 cm.
+#
+# Acting on that would drive the kart up to 16 cm the wrong way to correct 2.
+# So the longitudinal component is reported only when the cost actually RISES
+# as the candidate moves along the heading, by at least this much relative to
+# the cost at the optimum. Lateral is unaffected: it is well observed in
+# exactly the geometry where longitudinal is not (side walls are what a sweep
+# sees best), and it is the component with no other corrector.
+SCAN_FIT_OBSERVABLE_MIN_RISE = 1e-6
+
+# How far along the heading the gate probes for that rise. Large enough to
+# leave the flat floor of a genuine minimum, small enough to stay inside the
+# search window.
+SCAN_FIT_OBSERVABLE_PROBE_M = 0.04
+
+# Reject a fit that does not improve the residuals by at least this factor:
+# rms_after < rms_before * this. A fit that explains the readings no better
+# than the uncorrected pose did is not evidence of an error, it is the search
+# finding noise -- and shifting the belief on it adds error.
+SCAN_FIT_MIN_IMPROVEMENT = 0.9
+
+# Ceiling on the lateral correction applied to the belief in one sweep. Same
+# role as RANGE_FIX_MAX_CORRECTION_M: beyond this the fit is claiming the kart
+# is most of a cell from where odometry says, which is a wrong-cell hypothesis
+# rather than drift, and acting on it would teleport the belief.
+SCAN_FIT_MAX_LATERAL_M = 0.10
+
+# ---------------------------------------------------------------------------
+# THE OPEN RISK IN THIS WHOLE FEATURE: the beam is a cone, not a ray
+#
+# Everything above is measured against raycasts -- one ray per sample, hitting
+# exactly what it points at. A real HC-SR04 returns the NEAREST echo anywhere in
+# a ~15 degree cone, and `scan_fit` predicts ranges along the ray. Modelling the
+# cone (nearest of several rays across +-7.5 deg) and re-running the tcc.maze
+# study, lateral error against a true offset:
+#
+#     cone half-angle   median   p90     fits with >3 cm error
+#     0.0 deg (ray)     0.25 cm  0.81 cm    0.0%
+#     2.0 deg           0.63 cm  1.41 cm    1.1%
+#     4.0 deg           1.28 cm  3.08 cm   11.5%
+#     7.5 deg (real)    2.48 cm  4.82 cm   37.8%
+#
+# At the real cone width better than a third of fits are grossly wrong, and a
+# gross fit is acted on -- the caller shifts the belief by it. Raising
+# RANGE_FIX_MAX_TRUSTED_M to 0.90 was tried: it lifts the tcc.maze yield from
+# 7/17 to 12/17 cells and costs nothing under ideal rays, but under the cone
+# model it is no better (46/107 gross vs 37/98), because the cone, not the
+# range ceiling, is what dominates. So the ceiling stays at 0.45.
+#
+# What this means practically: the numbers above are an upper bound on how well
+# the sweep can work, and the bench will land somewhere between the ray and
+# cone rows. Before trusting the lateral correction on hardware, measure the
+# real sensor's spread by parking the kart at a known offset and sweeping --
+# if it looks like the 7.5 deg row, the fit needs a cone-aware forward model
+# (predict the min over a fan, not a single ray) rather than tighter gates.
+# That is a bigger change than this one and is why it has not been made here.
+# ---------------------------------------------------------------------------
+
+# Frames spent looking at one sweep heading before moving on. Telemetry repeats
+# its cached front reading between sensor updates, so "wait until we have N
+# distinct readings" can wait forever -- and a heading pointed at open space
+# never yields one at all. This bounds both cases; a heading that produced at
+# least one real reading still contributes a sample from however many it got.
+SWEEP_MAX_LOOKS_PER_ANGLE = 30
+
+# How long the fit's search parks the worker thread at a row boundary, so the
+# render loop gets the GIL. Measured against a CPU-bound worker, worst wait for
+# the main thread: no yield 17.5 ms, time.sleep(0) 26.0 ms (worse -- it does not
+# force a switch in CPython 3.14 and adds a syscall), time.sleep(5e-4) 2.8 ms.
+# Small enough that the fit still finishes in well under a second.
+SCAN_FIT_YIELD_S = 0.0005

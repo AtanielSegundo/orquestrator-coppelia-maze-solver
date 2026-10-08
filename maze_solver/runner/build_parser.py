@@ -23,16 +23,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="porta do web.py do kart (default: %(default)s)")
     p.add_argument("--turn-speed", type=float, default=0.2,
                    help="'speed' enviado no comando turn (default: %(default)s)")
-    p.add_argument("-cpd",
-                   "--coppelia_detach", 
-                   default=False,
+    p.add_argument("-cpd","--coppelia_detach", default=False,
                    action="store_true",
-                   help="Flag para indicar desprender o coppelia do processo atual"
-                        "(default: %(default)s)")
+                   help="Flag para indicar desprender o coppelia do processo atual (default: %(default)s)")
     p.add_argument("--drive-speed", type=float, default=0.2,
                        help="m/s enviado no comando drive_distance"
                             "(default: %(default)s)")
-        
+    p.add_argument("-wstp","--wait_to_step",action="store_true", default=False,
+                   help="Flag para que o proximo passo do orquestradot tenha validação manual"
+                   )
     p.add_argument("--video", choices=("sim", "client", "off"), 
                    default="sim",
                    help="stream producer -- ver camera_link/ "

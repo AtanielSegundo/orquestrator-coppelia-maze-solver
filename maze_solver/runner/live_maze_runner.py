@@ -15,12 +15,15 @@ from src.solver import solve_bfs, heading_between
 
 from runner.constants import (
     CAIXA_COR, GRID_HEADING_LABEL, LIVE_RETRY_INTERVAL_S,
+    RANGE_FIX_MAX_PREDICTED_M, SCAN_FIT_MIN_SAMPLES,
     OBSTACLE_DISTANCE_CM, SENSOR_CLEAR_CONFIRMATIONS,
     SENSOR_FORWARD_OFFSET_M, SENSOR_FROZEN_TRAVEL_M,
+    SWEEP_EVERY_N_LEGS,
 )
 from runner.leg import Leg
-from runner.range_fix import RangeFix
+from runner.range_fix import RangeFix, is_trusted_reading, predict_range
 from runner.recenter import Recenter
+from runner.sweep import Sweep, plan_angles
 
 
 class LiveMazeRunner:
@@ -50,7 +53,8 @@ class LiveMazeRunner:
                 view: MazeView, kart_view: KartView,
                 cell_length: float, ws_url: str,
                 turn_speed: float, drive_speed: float,
-                video_url: str, command_url: str, video_backend: str = "sim"):
+                video_url: str, command_url: str, 
+                video_backend: str = "sim", wait_to_step: bool = False):
         self.sim         = sim
         self.kart_base   = kart_base
         self.motors      = motors
@@ -62,6 +66,15 @@ class LiveMazeRunner:
         self.ws_url      = ws_url
         self.turn_speed  = turn_speed
         self.drive_speed = drive_speed
+        
+        # Manual step gate: with `should_wait`, each leg is held at the cell
+        # boundary until the operator calls release_step(). `_waiting_to_step`
+        # is "parked at the gate right now" (a press is only honoured then, so
+        # an early press cannot skip the next cell); `_step_released` is the
+        # press itself, consumed by the leg it lets through.
+        self.should_wait = wait_to_step
+        self._waiting_to_step = False
+        self._step_released = False
 
         # Video/pan-tilt mirror. Fully independent of the kart WS link (video
         # pulls straight over HTTP, and servo nudges fire-and-forget straight
@@ -96,6 +109,14 @@ class LiveMazeRunner:
         self._dist_seen_pose = None            # kart was when it first read it
         self._last_slip = {}                   # kart's slip sub-dict, for the HUD
         self.recenter: Optional[Recenter] = None   # physical recentring in flight
+        self.sweep: Optional[Sweep] = None         # angular sweep in flight
+        # Legs driven since the last sweep. A sweep costs ~8 rotations plus
+        # settling, so it runs every SWEEP_EVERY_N_LEGS boundaries rather than
+        # at every one -- lateral drift accumulates slowly now that each leg is
+        # an absolute goto.
+        self._legs_since_sweep = 0
+        self.sweeps_done = 0
+        self.last_sweep_summary = ""
 
         # Live-maze bookkeeping for the self-retry loop. `_live_revision` ticks
         # on every discovery and every un-discovery; a holding state compares it
@@ -246,6 +267,15 @@ class LiveMazeRunner:
         self.clear_obstacles()
         self.replan_requested = True
         self.state = "running"
+
+    def release_step(self) -> bool:
+        """Let the leg parked at the step gate go. Only counts while actually
+        parked there -- returns False (and does nothing) otherwise."""
+        if not self._waiting_to_step:
+            return False
+        self._step_released   = True
+        self._waiting_to_step = False
+        return True
 
     def clear_obstacles(self):
         """Live maze back to the original, in BOTH views: the discovered-cell
@@ -599,6 +629,124 @@ class LiveMazeRunner:
             print(f"[INFO] recentragem: {summary}")
 
         self.recenter = None
+        # Longitudinal axis is now as good as the sensor can make it, so hand
+        # over to the sweep for the lateral one. Chained here rather than in
+        # `_advance` so it only runs at a boundary that actually completed its
+        # recentring, never mid-leg.
+        self._start_sweep(wx, wy, wth)
+
+    # ---- angular sweep (2-DOF: the lateral axis nothing else sees) --------
+    def _start_sweep(self, wx, wy, wth):
+        """Begin an angular sweep at a cell boundary, if one is due AND the map
+        says there is something to measure against.
+
+        Deliberately AFTER recentring rather than instead of it: recentring is
+        closed-loop on the sensor and fixes the longitudinal axis properly, so
+        the sweep arrives with only the axis it is actually good at left to
+        measure. Running it first would have it fit a longitudinal error that
+        was about to be driven out anyway.
+
+        Two gates, and the second one matters more than it looks:
+
+        `SWEEP_EVERY_N_LEGS` is a floor on the interval, not a target. Driving
+        it purely on a leg count was measured to be fragile on tcc.maze -- WHICH
+        cells the count lands on decides the outcome, so a cadence of 2 came out
+        WORSE than 3 (12.8 cm vs 4.8 cm worst lateral error) purely by landing
+        on cells with no geometry. Aliasing against the maze layout is not a
+        property to tune against.
+
+        So the second gate asks the map, from the BELIEVED pose, whether a sweep
+        here would collect enough samples to fit at all -- a raycast-only probe,
+        no rotations spent. Skipping the hopeless boundaries and sweeping every
+        other one reaches the same accuracy as sweeping unconditionally while
+        attempting it 13 times instead of 16 on this path.
+        """
+        self._legs_since_sweep += 1
+        if self._legs_since_sweep < SWEEP_EVERY_N_LEGS:
+            return False
+        if not self._sweep_worth_trying(wx, wy, wth):
+            # Leave the counter standing: the next boundary with geometry should
+            # sweep immediately rather than wait out another full interval.
+            return False
+        self._legs_since_sweep = 0
+        self.sweep = Sweep(self.view, self.origin, self.cell_length,
+                           self.link, wx, wy, wth)
+        return True
+
+    def _sweep_worth_trying(self, wx, wy, wth) -> bool:
+        """Would a sweep here collect enough samples to fit? Map only.
+
+        Predicted against the BELIEVED pose and the original walls, which is the
+        only information available before spending the rotations. It can be
+        wrong in both directions -- the kart is not exactly where it is believed
+        to be -- but it is right about the thing that matters: a boundary in open
+        space where the map foresees nothing in range will not become fittable
+        just because the kart turns around in it.
+        """
+        angles = plan_angles(self.view, self.origin, self.cell_length,
+                             wx, wy, wth)
+        usable = 0
+        for offset in angles:
+            predicted, _hit = predict_range(
+                self.view, self.origin, self.cell_length,
+                wx, wy, wth + math.radians(offset),
+                RANGE_FIX_MAX_PREDICTED_M)
+            if predicted is None:
+                continue
+            if is_trusted_reading(predicted * 100.0):
+                usable += 1
+        return usable >= SCAN_FIT_MIN_SAMPLES
+
+    def _poll_sweep(self, drive_tel, wx, wy, wth):
+        """Drive the sweep forward one frame, and apply what it found.
+
+        What gets applied, and what does not:
+
+        * LATERAL moves the anchor. It is the component no other corrector in
+          the stack can observe (a forward ray cannot see sideways -- see
+          recenter.py), and the kart cannot translate sideways to cancel it, so
+          correcting the belief is the only available action.
+        * LONGITUDINAL is applied only when `scan_fit` reports it as
+          observable. In an open corridor it is not, and the number the search
+          returns there is arbitrary -- measured at -16 cm against a true
+          +2 cm on tcc.maze. `Recenter` has already closed that axis against
+          the sensor anyway, so skipping it costs nothing.
+        """
+        outcome = self.sweep.poll(drive_tel, wx, wy, wth)
+        if outcome == "pending":
+            self.status = f"varredura: {self.sweep.status}"
+            return
+
+        summary = self.sweep.summary()
+        self.last_sweep_summary = summary
+        lateral = self.sweep.applied_lateral
+        longitudinal = self.sweep.applied_longitudinal
+        if lateral is None:
+            print(f"[INFO] varredura: {summary}")
+            self.sweep = None
+            return
+
+        # Both components are expressed against the heading the sweep froze, so
+        # they rotate into the world frame through that heading, not the current
+        # one (the kart has turned since, and turned back).
+        th = self.sweep.pth
+        c, s = math.cos(th), math.sin(th)
+        along = longitudinal or 0.0
+        # lateral is +left of the heading; the left normal of (c, s) is (-s, c).
+        dx = c * along - s * lateral
+        dy = s * along + c * lateral
+        self.mirror.shift_anchor(dx, dy)
+        self.sweeps_done += 1
+        gated = "" if longitudinal is not None else " (long nao observavel)"
+        print(f"[INFO] varredura #{self.sweeps_done}: {summary}{gated}")
+
+        # Re-place both views now, as the range fix does, so the correction is
+        # visible at the boundary instead of appearing as a jump next frame.
+        cx, cy = wx + dx, wy + dy
+        self.mirror.apply_world_pose(cx, cy, wth)
+        self.last_world_pose = (cx, cy, wth)
+        self._update_kart_view(cx, cy, wth)
+        self.sweep = None
 
     def _apply_range_fix(self, drive_tel, wx, wy, wth):
         """Pull the believed pose along its heading to match what the front
@@ -692,6 +840,11 @@ class LiveMazeRunner:
         if self.recenter is not None:
             self._poll_recenter(drive_tel, wx, wy, wth)
             return
+        # Same exclusivity as recentring, and for the same reason: a sweep is
+        # issuing its own turns, so no leg may start on top of them.
+        if self.sweep is not None:
+            self._poll_sweep(drive_tel, wx, wy, wth)
+            return
 
         if self.leg is None:
             if self.replan_requested:
@@ -705,6 +858,17 @@ class LiveMazeRunner:
                 return
             frm = self.plan_path[self.plan_index]
             to = self.plan_path[self.plan_index + 1]
+
+            # Gate AFTER recentring/sweep (they returned above) and the replan,
+            # so the operator releases the leg that will really be driven, from
+            # the corrected pose. The goal check above is before this on
+            # purpose: nothing to confirm once the run is over.
+            if self.should_wait and not self._step_released:
+                self._waiting_to_step = True
+                self.status = f"[PASSO] em {frm} -- aperte ENTER para ir a {to}"
+                return
+            self._waiting_to_step = False
+            self._step_released = False
 
             target_world, odom_target = self._leg_target(to)
             self.leg = Leg(frm, to, wth, self.cell_length,
@@ -740,7 +904,20 @@ class LiveMazeRunner:
                        f"Replanejando sozinho...")
         print(f"[WARN] {self.status}")
         self.state = "blocked"
+        guard_seen = self.leg.guard_seen
         self.leg = None
+        # A leg that came up short is the case where the pose is MOST suspect --
+        # the kart stopped somewhere nobody planned -- and it used to be the one
+        # case that got no correction at all, after which `_reconsider_live`
+        # replanned from that uncorrected pose.
+        #
+        # Only when the front guard did NOT trip, though. A guard stop means
+        # something unmapped is in the beam, so the reading describes THAT, not
+        # the mapped wall the correction raycasts against; range_fix's own
+        # MAX_CORRECTION ceiling would mostly reject it, and "mostly" is not a
+        # guarantee worth leaning on.
+        if not guard_seen:
+            self._apply_range_fix(drive_tel, wx, wy, wth)
 
     # ---- rendering ---------------------------------------------------------
     def hud_lines(self):
@@ -766,6 +943,8 @@ class LiveMazeRunner:
         if self.obstacles_found:
             second += f"   |  {self.obstacles_found} obstaculo(s) no maze ao vivo"
         third = "L-click novo start   R-click novo goal"
+        if self._waiting_to_step:
+            third += "   |  ENTER = proximo passo"
         if self.state in ("blocked", "waiting"):
             third += "   (replanejando sozinho; 'resume' esquece tudo de uma vez)"
 
@@ -776,6 +955,13 @@ class LiveMazeRunner:
         # holds off.
         if self.recenter is not None:
             fix_line = f"recentrando: {self.recenter.status}"
+        elif self.sweep is not None:
+            fix_line = f"varredura: {self.sweep.status}"
+        elif self.last_sweep_summary:
+            # The sweep is the only thing correcting the lateral axis, and it
+            # runs every few legs rather than continuously, so its last result
+            # stays on screen until the next one replaces it.
+            fix_line = f"varredura ({self.sweeps_done}x): {self.last_sweep_summary}"
         else:
             fix_line = self.range_fix.status_line()
         if self._last_slip.get("slipping"):

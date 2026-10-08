@@ -49,8 +49,12 @@ from runner.live_maze_runner import LiveMazeRunner
 from runner.coppelia_evoke   import (evoke_coppelia, load_scene_in_coppelia,
                                      terminate_coppelia)
 
+# The user needs to press this key at each cell reached by the planing
+WAIT_TO_STEP_KEY = pr.KeyboardKey.KEY_ENTER
+
 def main():
     args = build_parser().parse_args()
+    
     maze_path = resolve_maze(args.maze)
     if maze_path is None:
         print(f"[ERROR] maze nao encontrado: {args.maze}")
@@ -90,7 +94,9 @@ def main():
     runner = LiveMazeRunner(sim, kart_base, motors, maze_path, view, kart_view,
                             args.cell_lenght, ws_url,
                             args.turn_speed, args.drive_speed,
-                            video_url, command_url, args.video)
+                            video_url, command_url, args.video,
+                            wait_to_step=args.wait_to_step
+                            )
 
     commands: "queue.Queue" = queue.Queue()
     threading.Thread(target=cli_thread, args=(commands,), daemon=True).start()
@@ -148,6 +154,11 @@ def main():
             cam_step = CAM_SPEED * dt
             d_pan = d_tilt = 0.0
             
+            # Step gate.
+            if (runner.should_wait and not track_gui_keys_mode
+                    and pr.is_key_pressed(WAIT_TO_STEP_KEY)):
+                runner.release_step()
+
             if track_gui_keys_mode:
                 # control keys (key queue)
                 while (_code := pr.get_key_pressed()) != 0:
@@ -170,6 +181,11 @@ def main():
                     if track_gui_keys_mode:
                         tracked_keys_str += chr(_cp)
             else:
+                # The key queue is only consumed in command mode; drain it here
+                # so presses made outside it (ENTER for the step gate, arrows)
+                # are not replayed as a stray submit the moment ':' is typed.
+                while pr.get_key_pressed() != 0:
+                    pass
                 while (_cp := pr.get_char_pressed()) != 0:
                     if chr(_cp) == TRACK_GUI_KEYBOARD_SYMBOL:
                         track_gui_keys_mode = True
