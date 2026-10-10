@@ -102,18 +102,15 @@ class LiveMazeRunner:
         self.visited: List[Tuple[int, int]] = []
         self.leg: Optional[Leg] = None
         self.status = ""
-        self._preview_heading = 0.0
-        self.last_world_pose = None            # (x, y, theta), once live
-        self.obstacles_found = 0               # discovered by the distance sensor
-        self._dist_seen_value = None           # last front reading, and where the
-        self._dist_seen_pose = None            # kart was when it first read it
-        self._last_slip = {}                   # kart's slip sub-dict, for the HUD
-        self.recenter: Optional[Recenter] = None   # physical recentring in flight
-        self.sweep: Optional[Sweep] = None         # angular sweep in flight
-        # Legs driven since the last sweep. A sweep costs ~8 rotations plus
-        # settling, so it runs every SWEEP_EVERY_N_LEGS boundaries rather than
-        # at every one -- lateral drift accumulates slowly now that each leg is
-        # an absolute goto.
+        self._preview_heading             = 0.0
+        self.last_world_pose              = None            # (x, y, theta), once live
+        self.obstacles_found              = 0               # discovered by the distance sensor
+        self._dist_seen_value             = None            # last front reading, and where the
+        self._dist_seen_pose              = None            # kart was when it first read it
+        self._last_slip                   = {}              # kart's slip sub-dict, for the HUD
+        self.recenter: Optional[Recenter] = None            # physical recentring in flight
+        self.sweep: Optional[Sweep]       = None            # angular sweep in flight
+        
         self._legs_since_sweep = 0
         self.sweeps_done = 0
         self.last_sweep_summary = ""
@@ -329,6 +326,7 @@ class LiveMazeRunner:
 
         self.replan_requested = False
         self._planned_revision = self._live_revision
+        
         if not path:
             # Not a dead end: _reconsider_live() keeps re-running this, so the
             # moment the live maze opens up -- something taken off the floor,
@@ -340,14 +338,19 @@ class LiveMazeRunner:
             else:
                 self.status = (f"[ESPERANDO] sem caminho a partir de {current_cell}. "
                                f"Escolha outro start/goal.")
+                
             if self.state != "waiting":
                 print(self.status)      # once per entry, not once per retry
+                
             self.plan_path = [current_cell]
             self.plan_index = 0
             self.state = "waiting"
+            
             return
+        
         if self.state in ("blocked", "waiting"):
             print(f"[INFO] caminho reaberto a partir de {current_cell} -- seguindo")
+        
         self.plan_path = path
         self.plan_index = 0
         self.state = "running"
@@ -360,13 +363,16 @@ class LiveMazeRunner:
 
         if self.phase != "live" or self.link is None:
             return
+        
         pose, wheel = self.link.latest()
+        
         if pose is None:
             return
         if self.odom_ref is None:
             self.odom_ref = pose
 
         wx, wy, wth = self.mirror.world_pose(pose, self.odom_ref)
+        
         self.mirror.apply_world_pose(wx, wy, wth)
         self.mirror.spin_wheels(wheel[0], wheel[1], dt)
         self.last_world_pose = (wx, wy, wth)
@@ -704,8 +710,10 @@ class LiveMazeRunner:
 
         * LATERAL moves the anchor. It is the component no other corrector in
           the stack can observe (a forward ray cannot see sideways -- see
-          recenter.py), and the kart cannot translate sideways to cancel it, so
-          correcting the belief is the only available action.
+          recenter.py). The sweep has usually also driven the KART back onto
+          the centre line by now (sweep.py, "Lateral recentring"), but that
+          move was tracked by odometry like any other, so the belief still
+          carries the fitted error and still needs this shift either way.
         * LONGITUDINAL is applied only when `scan_fit` reports it as
           observable. In an open corridor it is not, and the number the search
           returns there is arbitrary -- measured at -16 cm against a true

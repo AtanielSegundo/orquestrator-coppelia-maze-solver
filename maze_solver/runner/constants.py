@@ -51,7 +51,7 @@ COMMANDS = {
 # cell the obstacle actually falls in as blocked in the LIVE maze (see
 # LiveMazeRunner._scan_obstacle). The maze's own walls trip this too, which is
 # harmless -- they are already walls, so the mark is a no-op.
-OBSTACLE_DISTANCE_CM = 45.0
+OBSTACLE_DISTANCE_CM = 35.0
 
 # How far ahead of the kart's tracked CENTER the front sensor actually sits.
 # The reading is measured from the sensor, so this is added back before the
@@ -151,7 +151,7 @@ RANGE_FIX_MAX_PREDICTED_M = 1.20
 # 5 cm of headroom before an offset kart's reading fell outside it. 0.45 keeps
 # the 2-cell wall comfortably inside and still excludes the 3-cell one, where
 # heading error starts to dominate the residual.
-RANGE_FIX_MAX_TRUSTED_M = 0.45
+RANGE_FIX_MAX_TRUSTED_M = 0.5
 
 # Residual smaller than this is sensor quantisation, not drift: the kart
 # reports whole centimetres, so +-1 cm carries no information.
@@ -253,7 +253,7 @@ RECENTER_START_GRACE_S = 0.4
 # is an open-loop turn whose own error enters the fit through the sample's
 # recorded heading.
 SWEEP_HALF_SPAN_DEG = 75.0
-SWEEP_STEP_DEG = 15.0
+SWEEP_STEP_DEG = 25.0
 
 # Skip a side the map says is open: a sample that predicts no wall is dropped
 # by the fit anyway (scan_fit._residuals), so sweeping into open space spends
@@ -275,6 +275,25 @@ SWEEP_SAMPLES_PER_ANGLE = 3
 # Max wait for `goal_active` after a sweep rotation -- same stale-telemetry
 # guard as Leg.START_GRACE_S and RECENTER_START_GRACE_S.
 SWEEP_START_GRACE_S = 0.4
+
+# Lateral recentring at the end of a sweep (see runner/sweep.py's docstring):
+# from the last angle, nearly side-on to the corridor, drive forward/back so the
+# kart's centre lands on the cell's centre line, THEN turn back to the leg
+# heading. Off, the lateral error is only ever corrected in the belief, as
+# before. The move reuses Recenter's limits -- RECENTER_THRESHOLD_M (smallest
+# lateral error worth moving for), RECENTER_MIN_STEP_M / RECENTER_MAX_STEP_M
+# (move clamp) and RECENTER_SPEED -- since it is the same kind of
+# centimetre-scale corrective move.
+SWEEP_RECENTER_LATERAL = True
+
+# Smallest angle between the last sweep heading and the leg heading at which
+# the move is attempted. A move of d only reaches the lateral axis by
+# d*sin(angle): at 45 deg that is already 1.4x the lateral error in travel, as
+# much of it along the leg as across it; closer to the leg the move is mostly
+# longitudinal and not worth the time. The sweep normally ends at
+# SWEEP_HALF_SPAN_DEG (plan_angles finishes on its wider end), so this only
+# bites when a border cell has cut the span short.
+SWEEP_RECENTER_MIN_ANGLE_DEG = 45.0
 
 # Minimum interval between sweeps, in legs -- a FLOOR, not a target. 1 means
 # "every boundary that has geometry to measure against", which is what keeping
@@ -312,7 +331,7 @@ SWEEP_START_GRACE_S = 0.4
 # was WORSE than 3 (12.8 cm vs 4.8 cm) because of which cells the count lands
 # on -- the result aliases against the maze layout, so the knob is not
 # monotonic and tuning it is tuning noise.
-SWEEP_EVERY_N_LEGS = 1
+SWEEP_EVERY_N_LEGS = 3
 
 # ---------------------------------------------------------------------------
 # The fit itself (runner/scan_fit.py)
@@ -340,7 +359,7 @@ SCAN_FIT_FINE_STEP_M = 0.005
 #
 # The cost of the higher bar is fits refused, not fits made badly, and a
 # refused fit leaves the belief alone -- the safe direction.
-SCAN_FIT_MIN_SAMPLES = 4
+SCAN_FIT_MIN_SAMPLES = 3
 
 # Fraction of the worst residuals dropped before summing. ZERO, deliberately,
 # and this one is counter-intuitive enough to be worth the measurement.

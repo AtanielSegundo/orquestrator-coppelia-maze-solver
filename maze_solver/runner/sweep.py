@@ -22,7 +22,12 @@ Non-blocking, polled once per frame, exactly like `Recenter` -- issue a
 rotation, watch telemetry for it to finish, settle, average a few readings,
 rotate again. States:
 
-    plan -> turning -> settling -> sampling -> (next angle) ... -> fitting -> done
+    plan -> turning -> settling -> sampling -> (next angle) ...
+         -> fitting -> [moving -> settling] -> returning -> done
+
+The fit runs while the kart still faces the LAST angle, because that is the
+one heading in the whole session from which the lateral error can be driven
+out physically -- see "Lateral recentring" below.
 
 `poll()` returns "pending", "done" or "refused". The caller owns what happens to
 the correction; this module only produces it.
@@ -42,9 +47,33 @@ and a position fit is not a good reason to be the exception. The thread is
 started when the last sample is in and `poll()` returns "pending" until it
 finishes -- the kart is stationary by then, so there is nothing to race with.
 
-The kart is left pointing where it started. The sweep's whole purpose is to
-measure, and the leg that follows was planned from the heading the kart had
-before it; returning to that heading keeps the sweep transparent to the caller.
+The kart is left pointing where it started. The leg that follows was planned
+from the heading the kart had before it; returning to that heading keeps the
+sweep transparent to the caller.
+
+Lateral recentring
+------------------
+The kart cannot translate sideways, which is why a lateral error has so far
+only ever been corrected in the BELIEF (the caller's `shift_anchor`): the real
+kart stays off-centre, and the next leg's goto has to cut diagonally to reach
+the next centre.
+
+But at the end of the sweep the kart is NOT facing along the leg -- it is up to
+SWEEP_HALF_SPAN_DEG off it, nearly side-on to the corridor. A straight move
+from there is mostly lateral. So before turning back, with the leg heading
+`pth`, the current heading `th` and `e` the fitted pose's lateral offset from
+the cell centre (along the left normal of `pth`), the kart drives
+
+    d = -e / sin(th - pth)
+
+which zeroes the lateral offset. It also shifts the kart by d*cos(th - pth)
+along the leg, which is left to the next goto: that one aims at an absolute
+centre, so a longitudinal offset is just a slightly longer or shorter leg.
+
+The move is open loop and best effort, and it does not need to be exact.
+Odometry records whatever the wheels actually did, so the anchor correction
+the caller applies afterwards stays valid however far the kart really got --
+a short move only leaves some of the offset for the next sweep to find.
 """
 from __future__ import annotations
 
@@ -59,6 +88,9 @@ from runner.constants import (
     RANGE_FIX_MAX_PREDICTED_M, SWEEP_HALF_SPAN_DEG, SWEEP_SAMPLES_PER_ANGLE,
     SWEEP_MAX_LOOKS_PER_ANGLE, SWEEP_SETTLE_S, SWEEP_SIDE_PROBE_M,
     SWEEP_START_GRACE_S, SWEEP_STEP_DEG,
+    SWEEP_RECENTER_LATERAL, SWEEP_RECENTER_MIN_ANGLE_DEG,
+    RECENTER_MAX_STEP_M, RECENTER_MIN_STEP_M, RECENTER_SPEED,
+    RECENTER_THRESHOLD_M,
     SCAN_FIT_MAX_LATERAL_M, SCAN_FIT_MIN_IMPROVEMENT, SCAN_FIT_MIN_SAMPLES,
 )
 from runner.range_fix import is_trusted_reading, predict_range
@@ -83,9 +115,11 @@ def plan_angles(view, origin, cell_length, wx, wy, wth,
 
     Ordered to walk monotonically from one end to the other rather than
     out-and-back from centre, so consecutive rotations are one step apart and
-    the kart never re-traverses ground it already sampled. A kart FACING off
-    the map loses the middle of the span instead of an end; it then turns
-    across that gap in one rotation, without stopping in it.
+    the kart never re-traverses ground it already sampled -- ending on the end
+    furthest from the heading, where the lateral recentring move happens (see
+    Sweep). A kart FACING off the map loses the middle of the span instead of
+    an end; it then turns across that gap in one rotation, without stopping in
+    it.
     """
     def side_has_wall(sign: float) -> bool:
         # Probe at the mid-span angle of that side: a wall the sweep could
@@ -109,9 +143,15 @@ def plan_angles(view, origin, cell_length, wx, wy, wth,
     hi = +half_span if left else 0.0
     n = int(round((hi - lo) / step))
     span = [lo + i * step for i in range(n + 1)]
-    return [a for a in span
-            if not _leaves_maze(view, origin, cell_length, wx, wy,
-                                wth + math.radians(a))]
+    angles = [a for a in span
+              if not _leaves_maze(view, origin, cell_length, wx, wy,
+                                  wth + math.radians(a))]
+    # End on the WIDER end: the lateral recentring move is driven from the
+    # last angle, and a move there only reaches the lateral axis by
+    # sin(angle) -- so a one-sided sweep must finish at its +-75, not at 0.
+    if angles and abs(angles[0]) > abs(angles[-1]):
+        angles.reverse()
+    return angles
 
 
 def _leaves_maze(view, origin, cell_length, wx, wy, theta) -> bool:
@@ -145,12 +185,17 @@ class Sweep:
     `poll(drive_tel, wx, wy, wth)` returns:
 
         "pending"   still working -- call again next frame
-        "done"      finished; `fit` holds the correction (or None if refused)
+        "done"      finished, back on the original heading; `fit` holds the
+                    correction (or None if refused)
         "refused"   could not run at all (nothing to measure against)
 
     The pose arguments are the live believed pose. The pose the fit is computed
     AGAINST is the one captured at construction, because that is the pose every
     sample's geometry refers to and the one being corrected.
+
+    `lateral_move_m` is the recentring move actually commanded (None if none
+    was), for the caller's log; the anchor correction to apply is still
+    `applied_lateral` / `applied_longitudinal`, move or no move.
     """
 
     def __init__(self, view, origin, cell_length, link, wx, wy, wth,
@@ -172,6 +217,7 @@ class Sweep:
         self.status = "planejando"
         self.applied_lateral: Optional[float] = None
         self.applied_longitudinal: Optional[float] = None
+        self.lateral_move_m: Optional[float] = None
 
         self._index = 0
         self._phase = "turning"
@@ -183,7 +229,9 @@ class Sweep:
         self._looks = 0
         self._thread: Optional[threading.Thread] = None
         self._fit_done = threading.Event()
+        self._fit_error: Optional[str] = None
         self._returning = False
+        self._result = ""                # final status, shown once back on heading
         self._refused: Optional[str] = None
 
         if len(self.angles) < SCAN_FIT_MIN_SAMPLES:
@@ -223,7 +271,9 @@ class Sweep:
         if self._phase == "sampling":
             return self._do_sampling(drive_tel, wth)
         if self._phase == "fitting":
-            return self._do_fitting()
+            return self._do_fitting(wx, wy, wth)
+        if self._phase == "moving":
+            return self._do_moving(drive_tel)
         return "done"
 
     def _do_turning(self, drive_tel, wth) -> str:
@@ -249,9 +299,10 @@ class Sweep:
         if self._clock() < self._settle_until:
             return "pending"
         if self._returning:
-            # Back on the original heading with every sample collected.
-            self._phase = "fitting"
-            return "pending"
+            # Back on the original heading: fitted, recentred, finished.
+            self._phase = "done"
+            self.status = self._result
+            return "done"
         self._readings = []
         self._looks = 0
         self._phase = "sampling"
@@ -298,18 +349,24 @@ class Sweep:
 
     def _advance_angle(self) -> None:
         self._index += 1
-        if self._index >= len(self.angles):
-            self._returning = True
+        self._issued_from = None
+        # Past the last angle: fit right here, still facing it -- see the
+        # module docstring's "Lateral recentring" for why not after returning.
+        self._phase = "turning" if self._index < len(self.angles) else "fitting"
+
+    def _begin_return(self) -> None:
+        self._returning = True
         self._phase = "turning"
         self._issued_from = None
 
     # -- the fit, off the render thread ------------------------------------
-    def _do_fitting(self) -> str:
+    def _do_fitting(self, wx, wy, wth) -> str:
         if self._thread is None:
             if len(self.samples) < SCAN_FIT_MIN_SAMPLES:
-                self.status = (f"{len(self.samples)} amostras validas, "
-                               f"minimo {SCAN_FIT_MIN_SAMPLES}")
-                return "done"
+                self._result = (f"{len(self.samples)} amostras validas, "
+                                f"minimo {SCAN_FIT_MIN_SAMPLES}")
+                self._begin_return()
+                return "pending"
             self.status = f"ajustando {len(self.samples)} amostras..."
             self._thread = threading.Thread(target=self._fit_worker,
                                             daemon=True, name="ScanFit")
@@ -317,7 +374,11 @@ class Sweep:
             return "pending"
         if not self._fit_done.is_set():
             return "pending"          # a few frames at most; kart is stopped
-        return self._finish()
+        self._judge_fit()
+        if self._start_lateral_move(wx, wy, wth):
+            return "pending"
+        self._begin_return()
+        return "pending"
 
     def _fit_worker(self) -> None:
         try:
@@ -329,41 +390,106 @@ class Sweep:
                                 self.px, self.py, self.pth, self.samples,
                                 yield_every=2)
         except Exception as exc:                                  # noqa: BLE001
+            # Not `_refused`: that would end the session right here, leaving
+            # the kart facing the last sweep angle. It still has to turn back.
             self.fit = None
-            self._refused = f"ajuste falhou: {exc}"
+            self._fit_error = f"ajuste falhou: {exc}"
         finally:
             self._fit_done.set()
 
-    def _finish(self) -> str:
+    def _judge_fit(self) -> None:
         """Decide what of the fit may be believed, and record it."""
         fit = self.fit
+        if self._fit_error is not None:
+            self._result = self._fit_error
+            return
         if fit is None:
-            self.status = "sem ajuste (geometria insuficiente)"
-            return "done"
+            self._result = "sem ajuste (geometria insuficiente)"
+            return
 
         # A fit that explains the readings no better than the uncorrected pose
         # did is the search finding noise, not evidence of an error.
         if fit.rms_after > fit.rms_before * SCAN_FIT_MIN_IMPROVEMENT:
-            self.status = (f"ajuste rejeitado: rms {fit.rms_before*100:.1f} -> "
-                           f"{fit.rms_after*100:.1f} cm (sem ganho)")
+            self._result = (f"ajuste rejeitado: rms {fit.rms_before*100:.1f} -> "
+                            f"{fit.rms_after*100:.1f} cm (sem ganho)")
             self.fit = None
-            return "done"
+            return
 
         if abs(fit.lateral) > SCAN_FIT_MAX_LATERAL_M:
             # Most of a cell sideways is a wrong-cell hypothesis, not drift.
-            self.status = (f"lateral {fit.lateral*100:+.1f} cm grande demais "
-                           f"(parede errada?)")
+            self._result = (f"lateral {fit.lateral*100:+.1f} cm grande demais "
+                            f"(parede errada?)")
             self.fit = None
-            return "done"
+            return
 
         self.applied_lateral = fit.lateral
         self.applied_longitudinal = fit.longitudinal
         lo = ("n/d" if fit.longitudinal is None
               else f"{fit.longitudinal*100:+.1f} cm")
-        self.status = (f"lateral {fit.lateral*100:+.1f} cm, long {lo} "
-                       f"({fit.used} amostras, rms {fit.rms_before*100:.1f} -> "
-                       f"{fit.rms_after*100:.1f} cm)")
-        return "done"
+        self._result = (f"lateral {fit.lateral*100:+.1f} cm, long {lo} "
+                        f"({fit.used} amostras, rms {fit.rms_before*100:.1f} -> "
+                        f"{fit.rms_after*100:.1f} cm)")
+
+    # -- lateral recentring, from the last angle ---------------------------
+    def _start_lateral_move(self, wx, wy, wth) -> bool:
+        """Issue the move that puts the kart on the cell's centre line, if one
+        is due. Returns True when a move was issued. See the module docstring.
+        """
+        if not SWEEP_RECENTER_LATERAL or self.applied_lateral is None:
+            return False
+
+        off = _wrap(wth - self.pth)
+        reach = math.sin(off)                # lateral metres per metre driven
+        if abs(reach) < math.sin(math.radians(SWEEP_RECENTER_MIN_ANGLE_DEG)):
+            self._result += (f" | sem recentragem lateral (ultimo angulo "
+                             f"{math.degrees(off):+.0f} deg)")
+            return False
+
+        # Where the fit says the kart is NOW. The correction is to the anchor,
+        # so it holds for the live belief just as for the frozen one -- the
+        # in-place rotations since then moved both together.
+        c, s = math.cos(self.pth), math.sin(self.pth)
+        along = self.applied_longitudinal or 0.0
+        fx = wx + c * along - s * self.applied_lateral
+        fy = wy + s * along + c * self.applied_lateral
+        rf, cf = cop.world_to_cell(self.origin, self.cell_length, fx, fy)
+        ccx, ccy, _ = cop.cell_to_world(self.origin, self.cell_length,
+                                        (round(rf), round(cf)))
+        # Offset from the centre line, along the left normal (-s, c) of pth.
+        error = (fx - ccx) * -s + (fy - ccy) * c
+        if abs(error) < RECENTER_THRESHOLD_M:
+            self._result += f" | lateral ja centrada ({error*100:+.1f} cm)"
+            return False
+
+        move = -error / reach
+        move = max(-RECENTER_MAX_STEP_M, min(RECENTER_MAX_STEP_M, move))
+        if abs(move) < RECENTER_MIN_STEP_M:
+            self._result += (f" | recentragem lateral {move*100:+.1f} cm menor "
+                             f"que o passo minimo")
+            return False
+
+        self.lateral_move_m = move
+        self.link.drive_distance(move, RECENTER_SPEED)
+        self._seen_active = False
+        self._active_by = self._clock() + SWEEP_START_GRACE_S
+        self._phase = "moving"
+        verb = "avancando" if move > 0 else "recuando"
+        self.status = (f"recentrando lateral: {verb} {abs(move)*100:.1f} cm "
+                       f"a {math.degrees(off):+.0f} deg")
+        self._result += (f" | recentrou lateral {error*100:+.1f} cm "
+                         f"({verb} {abs(move)*100:.1f} cm a "
+                         f"{math.degrees(off):+.0f} deg)")
+        return True
+
+    def _do_moving(self, drive_tel) -> str:
+        if self._wait_for_start(drive_tel):
+            return "pending"
+        if drive_tel.get("goal_active"):
+            return "pending"
+        # No settle of its own: the return turn that follows settles anyway,
+        # and nothing is measured in between.
+        self._begin_return()
+        return "pending"
 
     # -- reporting ---------------------------------------------------------
     def summary(self) -> str:

@@ -89,10 +89,21 @@ class FakeKart:
         self.quantise = quantise
         self._active = 0
         self.turns = []
+        self.drives = []
+        self.events = []                  # ("turn"|"drive", value), in order
 
     def turn(self, angle_deg, speed=1.0):
         self.turns.append(angle_deg)
+        self.events.append(("turn", angle_deg))
         self.theta += math.radians(angle_deg) * self.turn_scale
+        self._active = self.active_polls
+
+    def drive_distance(self, distance_m, speed=0.2):
+        """Straight move along the TRUE heading -- the recentring move."""
+        self.drives.append(distance_m)
+        self.events.append(("drive", distance_m))
+        self.tx += math.cos(self.theta) * distance_m
+        self.ty += math.sin(self.theta) * distance_m
         self._active = self.active_polls
 
     def telemetry(self):
@@ -179,6 +190,9 @@ class TestPlanAngles(unittest.TestCase):
         self.assertGreaterEqual(len(angles), SCAN_FIT_MIN_SAMPLES)
 
     # Frame reminder: theta 0 is +X (col+1, east), +90 is +Y (row-1, north).
+    # The border tests pin the span/step to 75/15 so they test the geometry
+    # rule, not whatever SWEEP_STEP_DEG is tuned to this week.
+    GEOM = dict(half_span=75.0, step=15.0)
 
     def test_border_cell_skips_headings_off_the_map(self):
         """Top row, driving east along the border: the left (north) end of the
@@ -186,10 +200,12 @@ class TestPlanAngles(unittest.TestCase):
         (-1, 3) -- off the map as well."""
         view = OpenField()
         cx, cy = center((0, 2))
-        angles = plan_angles(view, ORIGIN, CELL, cx, cy, 0.0)
-        self.assertAlmostEqual(min(angles), -SWEEP_HALF_SPAN_DEG)
+        angles = plan_angles(view, ORIGIN, CELL, cx, cy, 0.0, **self.GEOM)
+        self.assertAlmostEqual(min(angles), -75.0)
         self.assertAlmostEqual(max(angles), 30.0)
-        self.assertEqual(angles, sorted(angles))
+        # Walked toward the wide end, so it finishes side-on to the corridor.
+        self.assertEqual(angles, sorted(angles, reverse=True))
+        self.assertAlmostEqual(angles[-1], -75.0)
 
     def test_corner_cell_keeps_only_the_inward_quadrant(self):
         """Top-right corner, facing east: north and east are both off the map,
@@ -197,17 +213,21 @@ class TestPlanAngles(unittest.TestCase):
         the sweep refuses instead of turning for nothing."""
         view = OpenField()
         cx, cy = center((0, 4))
-        angles = plan_angles(view, ORIGIN, CELL, cx, cy, 0.0)
-        self.assertEqual(angles, [-75.0, -60.0])
+        angles = plan_angles(view, ORIGIN, CELL, cx, cy, 0.0, **self.GEOM)
+        self.assertEqual(angles, [-60.0, -75.0])
         s, _clock = make_sweep(FakeKart(view, (cx, cy)), view, (cx, cy))
-        self.assertEqual(s.poll({}, cx, cy, 0.0), "refused")
+        if len(s.angles) < SCAN_FIT_MIN_SAMPLES:
+            self.assertEqual(s.poll({}, cx, cy, 0.0), "refused")
+        # Whatever the production step, nothing outside the inward quadrant.
+        self.assertTrue(all(a < -45.0 for a in s.angles), s.angles)
 
     def test_facing_off_the_map_drops_the_middle(self):
         """Top row, facing north (straight out): the centre of the span goes,
         both flanks stay, and the order is still one monotonic walk."""
         view = OpenField()
         cx, cy = center((0, 2))
-        angles = plan_angles(view, ORIGIN, CELL, cx, cy, math.radians(90.0))
+        angles = plan_angles(view, ORIGIN, CELL, cx, cy, math.radians(90.0),
+                             **self.GEOM)
         self.assertEqual(angles, [-75.0, -60.0, 60.0, 75.0])
 
     def test_interior_cell_loses_nothing(self):
@@ -345,6 +365,68 @@ class TestSweepRun(unittest.TestCase):
             s.poll(tel, cx, cy, kart.theta)
         self.assertEqual(len(s.samples), before,
                          "samples were taken while slipping")
+
+
+class TestLateralRecentring(unittest.TestCase):
+    """From the last sweep angle, side-on to the corridor, the kart drives back
+    onto the cell's centre line before turning back to the leg heading."""
+
+    def test_puts_the_real_kart_on_the_centre_line(self):
+        view = DeadEnd()
+        cx, cy = center((1, 3))
+        lat = 0.035
+        kart = FakeKart(view, (cx, cy + lat))
+        outcome, s = run_sweep(kart, view, (cx, cy))
+        self.assertEqual(outcome, "done")
+        self.assertEqual(len(kart.drives), 1, s.status)
+        # Same tolerance the fit itself is held to: the move is only as good
+        # as the lateral it was computed from.
+        self.assertAlmostEqual(kart.ty, cy, delta=0.015,
+                               msg=f"still {(kart.ty - cy)*100:+.1f} cm off "
+                                   f"after {s.status}")
+        # The correction for the belief is still reported, move or no move.
+        self.assertAlmostEqual(s.applied_lateral, lat, delta=0.015)
+
+    def test_moves_before_turning_back(self):
+        """The move is only lateral from the side-on last angle; made after the
+        return turn it would be purely longitudinal."""
+        view = DeadEnd()
+        cx, cy = center((1, 3))
+        kart = FakeKart(view, (cx, cy + 0.035))
+        run_sweep(kart, view, (cx, cy))
+        kinds = [k for k, _v in kart.events]
+        self.assertEqual(kinds[-2:], ["drive", "turn"], kart.events)
+        self.assertAlmostEqual(math.degrees(kart.theta), 0.0, delta=1.0)
+
+    def test_short_rotations_still_land_on_the_centre_line(self):
+        """Every turn 12% short: the last heading is ~66 deg instead of 75. The
+        move is sized from the MEASURED heading, so it still lands."""
+        view = DeadEnd()
+        cx, cy = center((1, 3))
+        kart = FakeKart(view, (cx, cy + 0.03), turn_scale=0.88)
+        run_sweep(kart, view, (cx, cy))
+        self.assertEqual(len(kart.drives), 1)
+        self.assertAlmostEqual(kart.ty, cy, delta=0.02)
+
+    def test_no_move_when_already_centred(self):
+        view = DeadEnd()
+        cx, cy = center((1, 3))
+        kart = FakeKart(view, (cx, cy))
+        _out, s = run_sweep(kart, view, (cx, cy))
+        self.assertEqual(kart.drives, [], s.status)
+
+    def test_can_be_switched_off(self):
+        view = DeadEnd()
+        cx, cy = center((1, 3))
+        kart = FakeKart(view, (cx, cy + 0.035))
+        saved = sweep_mod.SWEEP_RECENTER_LATERAL
+        sweep_mod.SWEEP_RECENTER_LATERAL = False
+        try:
+            _out, s = run_sweep(kart, view, (cx, cy))
+        finally:
+            sweep_mod.SWEEP_RECENTER_LATERAL = saved
+        self.assertEqual(kart.drives, [])
+        self.assertIsNotNone(s.applied_lateral, s.status)
 
 
 if __name__ == "__main__":
