@@ -36,4 +36,11 @@ def build_parser() -> argparse.ArgumentParser:
                    default="sim",
                    help="stream producer -- ver camera_link/ "
                         "(default: %(default)s)")
+    p.add_argument("--camera-calib", default=None,
+                   help="calibracao da camera para a correcao de pose "
+                        "(default: camera_link/camera_calib.json; sem arquivo "
+                        "usa os valores nominais da Pi Camera rev 1.3)")
+    p.add_argument("--no-camera-fix", action="store_true", default=False,
+                   help="desliga a correcao de pose pela camera (volta a "
+                        "recentragem + varredura de antes)")
     return p

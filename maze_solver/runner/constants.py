@@ -22,6 +22,8 @@ COMANDOS DO PROMPT
   goal  <lin> <col>   novo goal (antes ou durante a corrida)
   resume              esquece TODOS os obstaculos descobertos de uma vez e
                       replaneja
+  camfix              mede a pose com a camera ali mesmo, sem aplicar nada
+                      (bancada; imagens de debug em maze_solver/logs/camera)
   status              imprime o estado atual
   help | quit
 """
@@ -40,6 +42,7 @@ COMMANDS = {
     "start":  (2, 2),
     "goal":   (2, 2),
     "resume": (0, 0),
+    "camfix": (0, 0),
     "status": (0, 0),
     "quit":   (0, 0),
 }
@@ -57,7 +60,7 @@ OBSTACLE_DISTANCE_CM = 35.0
 # The reading is measured from the sensor, so this is added back before the
 # hit point is projected onto the grid; otherwise every obstacle lands about
 # half a kart-length too close and can be blamed on the wrong cell.
-SENSOR_FORWARD_OFFSET_M = 0.13
+SENSOR_FORWARD_OFFSET_M = 0.113
 
 # The other half of every front reading: whatever the beam passed THROUGH on
 # its way to the hit point has to be empty, or it would have stopped earlier.
@@ -461,3 +464,249 @@ SWEEP_MAX_LOOKS_PER_ANGLE = 30
 # force a switch in CPython 3.14 and adds a syscall), time.sleep(5e-4) 2.8 ms.
 # Small enough that the fit still finishes in well under a second.
 SCAN_FIT_YIELD_S = 0.0005
+
+
+# ---------------------------------------------------------------------------
+# Camera pose fix (runner/camera_fix.py, runner/camera_fit.py)
+#
+# The sweep above recovers the LATERAL axis by rotating the whole kart through
+# ~10 headings and reading an ultrasonic whose cone smears the very profile it
+# fits. The camera sees the same geometry in one look: where each wall stands
+# on the floor (the floor-contact profile, camera_link/contact_profile.py) moves
+# in the image when the kart moves sideways, and the pan servo turns the CAMERA
+# instead of the kart to look at the side walls. So at each cell the camera
+# fit runs first, corrects lateral + yaw in the belief, optionally drives the
+# kart back to the centre, and the sweep only runs when the camera could not
+# produce a lateral at that cell.
+# ---------------------------------------------------------------------------
+CAMERA_FIX_ENABLED = True
+
+# Run one fix right after 'ok', before the first leg: it corrects the
+# operator's placement, and doubles as a health check of the calibration (a
+# kart placed carefully on the start cell should measure close to zero).
+CAMERA_FIX_AT_START = True
+
+# Hold the tilt servo at CAMERA_FIX_TILT_PCT for the whole run instead of
+# returning to the level home tilt between fixes. Tilt repeatability then stops
+# mattering: the head never leaves the tilt it was calibrated at.
+CAMERA_FIX_HOLD_TILT = True
+
+# Calibration file read by default (runner/camera_setup.py), relative to the
+# orquestrator directory. Missing is fine: the hardware defaults below are
+# used and the HUD says so.
+CAMERA_CALIB_DEFAULT_PATH = "camera_link/camera_calib.json"
+
+# -- Hardware: Raspberry Pi Camera rev 1.3 (OV5647) --------------------------
+# Server/proc_camera.py asks Picamera2 for a 400x300 video stream. libcamera
+# serves that from the OV5647's 640x480 mode, which reads a 2560x1920 window
+# of the sensor (binned) and the ISP scales it to 400x300. Pixel pitch is
+# 1.4 um and the lens is the stock 3.6 mm, so one stream pixel is
+# 2560*1.4/400 = 8.96 um of sensor and
+#
+#     f = 3.6 mm / 8.96 um = 401.8 px   (HFOV 52.9 deg, VFOV 41 deg)
+#
+# which matches the datasheet's 53.5 x 41.4 deg for the full sensor. The mode
+# table is the kart's own (`rpicam-hello --list-cameras`): 640x480 reads
+# (16, 0)/2560x1920. Were Picamera2 to pick the 1296x972 mode instead (the whole
+# 2592 px width), f would be 397 px -- 1.2% off, inside what intrinsics
+# calibration corrects anyway. These are
+# the defaults until `camera_calibrate.py intrinsics` measures the real lens;
+# the stock lens is close to distortion-free at this resolution.
+#
+# The kart's module is a clone sold as "OV5647 5MP, 3.6 mm, 60 deg". The 3.6 mm
+# is what is used here; the 60 deg fits neither axis (60 deg horizontal would be
+# f = 346 px, 60 deg diagonal f = 433 px, while 3.6 mm gives 53 x 41 deg, 64
+# diagonal), so it is taken as a rounded marketing figure. The lens is a screw
+# mount whose focus also shifts f a little -- measure it, and do not turn the
+# lens after calibrating.
+CAMERA_STREAM_SIZE = (400, 300)
+CAMERA_FOCAL_MM = 3.6
+CAMERA_PIXEL_UM = 1.4
+CAMERA_SENSOR_CROP_PX = 2560
+
+# -- Mount ------------------------------------------------------------------
+# Lens position relative to the kart's odometry centre (the (0, 0) the pose
+# tracks): 13 cm ahead, on the centre line, 10 cm above the floor -- the same
+# direction as the sonar. Measured at the fix tilt.
+CAMERA_LENS_FORWARD_M = 0.13
+CAMERA_LENS_LATERAL_M = 0.0
+CAMERA_LENS_HEIGHT_M = 0.10
+
+# Distance from the pan servo's axis to the lens, along the optical axis. A
+# side view moves the lens sideways by arm*sin(pan) -- 1.8 cm at 45 deg with
+# 2.5 cm -- which is the size of the error being measured, so it is modelled.
+# MEASURE IT: ruler from the pan shaft to the lens.
+CAMERA_PAN_ARM_M = 0.025
+
+# -- Servo head -------------------------------------------------------------
+# One CMD_SERVO unit is one servo degree: Server/servo.py drives
+# 500 + (angle + 10) / 0.09 us, i.e. 11.1 us per unit on a 2000 us / 180 deg
+# servo. Home values are CameraMirror's (camera level and centred).
+CAMERA_PAN_HOME_PCT = 50
+CAMERA_TILT_HOME_PCT = 37
+CAMERA_SERVO_DEG_PER_PCT = 1.0
+# Direction conventions, as wired by the arrow keys in main.py (LEFT raises
+# pan, DOWN lowers tilt). Check both on the bench with the overlay tool -- a
+# wrong sign shows as a mirrored or inverted model, not as a subtle error.
+CAMERA_PAN_LEFT_IS_HIGHER = True
+CAMERA_TILT_DOWN_IS_LOWER = True
+
+# Tilt held during fixes. Level, the floor contacts nearer than ~0.33 m fall
+# below the image, and those are the ones with the best resolution: with the
+# lens only 10 cm up, a contact moves f*h/r^2 px per metre -- 4 px/cm at
+# 0.3 m but 0.5 px/cm at 0.9 m. Pitched 25 deg down (12 = 37 - 25) the image
+# spans the floor from ~0.10 m ahead of the lens to past the range limit.
+CAMERA_FIX_TILT_PCT = 12
+
+# Views, as (name, pan in degrees relative to home, + = left). The side views
+# look straight at the current cell's own side walls, which is where lateral
+# offset shows best (a wall's contact row moves directly with it); the forward
+# view defines yaw. HFOV is ~53 deg, so +-45 covers +-72 deg around the leg.
+CAMERA_FIX_VIEWS = (("direita", -45.0), ("frente", 0.0), ("esquerda", 45.0))
+
+# Rows at the bottom of each view excluded from the profile (kart body, sonar
+# module). Per view in the calibration file once measured.
+CAMERA_FIX_IGNORE_BOTTOM_PX = 20
+
+# Every view is approached from the same side (from this many units below the
+# lowest pan), so servo backlash lands each view in the same place every time.
+CAMERA_FIX_PREPOSITION_PCT = 6
+
+# -- Timing -----------------------------------------------------------------
+# Same reasoning as RECENTER_SETTLE_S: let the chassis stop rocking.
+CAMERA_FIX_KART_SETTLE_S = 0.30
+# Head ringing after a pan move. Re-measure on the bench.
+CAMERA_FIX_SERVO_SETTLE_S = 0.50
+# Capture -> JPEG -> WiFi -> decode. A frame is only used if it was DECODED at
+# least this long after the head settled, so it was taken after it too.
+CAMERA_FIX_FRAME_LATENCY_S = 0.20
+# Wait for the kart to report the servo command (servo telemetry) at most
+# this long; a server that does not publish it just skips the wait.
+CAMERA_FIX_SERVO_ACK_TIMEOUT_S = 1.0
+# A view that has not produced its frames by then is skipped.
+CAMERA_FIX_VIEW_TIMEOUT_S = 2.5
+# Frames combined per view (median profile): one blurred frame cannot move it.
+CAMERA_FIX_FRAMES_PER_VIEW = 3
+
+# -- Profile and model ------------------------------------------------------
+# Beyond this floor range (from the point under the lens) a contact carries
+# almost no information at this camera height (see CAMERA_FIX_TILT_PCT), and
+# the map stops being a trustworthy description of the room.
+CAMERA_FIX_MAX_FLOOR_RANGE_M = 0.90
+CAMERA_FIX_COLUMN_STEP_PX = 4
+CAMERA_FIX_ROW_STEP_PX = 2
+CAMERA_FIX_MIN_RUN_PX = 3
+# Bearing resolution of the visibility raycast: 0.15 deg is 2.4 mm at 0.9 m
+# and 0.8 mm at 0.3 m, under a pixel everywhere in range.
+CAMERA_FIX_BEARING_STEP_DEG = 0.15
+
+# Wall/floor colour model (camera_link/floor_segmenter.py). The margin is how
+# far from a PREDICTED boundary a pixel must be to train on: larger than the
+# image shift of a few cm of pose error near the kart.
+CAMERA_SEG_COMPONENTS = 2
+CAMERA_SEG_L_WEIGHT = 1.0 / 3.0
+CAMERA_SEG_LABEL_MARGIN_PX = 12
+CAMERA_SEG_MIN_PIXELS = 300
+CAMERA_SEG_MIN_ACCURACY = 0.85
+
+# -- Cost -------------------------------------------------------------------
+# Residual per column = gap between the measured and the predicted contact
+# intervals, in units of PIXEL_SIGMA; Huber beyond HUBER_K, flat beyond
+# TRUNCATE_K so a person or a bag in view is a bounded outlier.
+CAMERA_FIX_PIXEL_SIGMA_PX = 1.5
+CAMERA_FIX_HUBER_K = 2.0
+CAMERA_FIX_TRUNCATE_K = 6.0
+# Neighbouring columns see the same wall edge, so their errors are not
+# independent. The cost and the information are divided by this.
+CAMERA_FIX_COLUMN_CORRELATION = 3.0
+
+# -- Search -----------------------------------------------------------------
+# Window: under half a cell, like SCAN_FIT_MAX_SHIFT_M -- a larger error is a
+# lost pose, and a wider window mostly finds the next cell's walls.
+CAMERA_FIX_SEARCH_HALF_M = 0.10
+CAMERA_FIX_SEARCH_HALF_YAW_DEG = 6.0
+CAMERA_FIX_COARSE_STEP_M = 0.02
+CAMERA_FIX_COARSE_STEP_YAW_DEG = 1.0
+# The coarse grid scores with the pixel sigma multiplied by this. Near a side
+# wall a contact moves ~4 px per cm of lateral, so a 2 cm step moves it ~8 px:
+# at the real sigma every candidate but the exact one is past the truncation,
+# the cost is a spike the grid steps over, and the coarse optimum is whichever
+# wrong candidate happens to clip fewest columns. Measured on the synthetic
+# corridor: at scale 1 the coarse stage missed a 3 cm / 2 deg offset outright;
+# widened, the basin is several grid steps wide and the fine stage (real sigma)
+# then resolves it.
+CAMERA_FIX_COARSE_SIGMA_SCALE = 4.0
+# Local minima of the coarse stage finished independently by Levenberg-
+# Marquardt; the cheapest result wins (see camera_fit.CameraFitter._basins).
+CAMERA_FIX_FINE_STARTS = 3
+# LM iterations per sigma level (coarse-scaled, 2x, real).
+CAMERA_FIX_LM_ITERATIONS = 12
+# Prior on the kart's yaw error. Honest, not tight: turns err by 1-5 deg (see
+# SWEEP_EVERY_N_LEGS), and against a single wall seen face-on lateral and yaw
+# trade off -- a tight prior would turn real yaw error into a confident wrong
+# lateral.
+CAMERA_FIX_YAW_PRIOR_DEG = 3.0
+# Weak prior on translation, so a direction the data cannot see (longitudinal
+# in a corridor) settles at zero instead of wherever the search started.
+CAMERA_FIX_TRANSLATION_PRIOR_M = 0.08
+# Side views' pan is uncertain by about this much (servo repeatability); the
+# fit absorbs it per view instead of reading it as kart yaw. 0 disables.
+CAMERA_FIX_PAN_NUISANCE_SIGMA_DEG = 1.0
+CAMERA_FIX_PAN_NUISANCE_HALF_DEG = 2.0
+
+# -- Gates ------------------------------------------------------------------
+CAMERA_FIX_MIN_HITS_PER_VIEW = 12
+CAMERA_FIX_MIN_HITS_TOTAL = 30
+CAMERA_FIX_MIN_INLIER_FRACTION = 0.6
+CAMERA_FIX_MAX_RMS_PX = 2.0
+# Marginal standard deviation above which an axis is reported unobservable.
+CAMERA_FIX_MAX_STD_LAT_M = 0.008
+CAMERA_FIX_MAX_STD_LONG_M = 0.010
+CAMERA_FIX_MAX_STD_YAW_DEG = 0.6
+CAMERA_FIX_MAX_LATERAL_M = SCAN_FIT_MAX_LATERAL_M
+CAMERA_FIX_MAX_LONG_M = 0.10
+CAMERA_FIX_MAX_YAW_DEG = 5.0
+# A second lateral hypothesis at least this far away must cost clearly more
+# (in noise units) than the best one, or lateral is ambiguous.
+CAMERA_FIX_AMBIGUITY_SEPARATION_M = 0.03
+CAMERA_FIX_AMBIGUITY_MIN_DELTA = 4.5
+# The fit must explain the image this much better than the uncorrected pose.
+CAMERA_FIX_MIN_IMPROVEMENT = 0.8
+# Below these the pose is "confirmed": nothing is applied, but lateral counts
+# as checked and the sweep is not needed.
+CAMERA_FIX_CONFIRM_M = 0.008
+CAMERA_FIX_CONFIRM_YAW_DEG = 0.4
+CAMERA_FIX_YAW_GAIN = 1.0
+
+# -- Abort ------------------------------------------------------------------
+# The kart is presumed still from capture to the end of the fix.
+CAMERA_FIX_KART_MOVED_M = 0.005
+CAMERA_FIX_KART_MOVED_DEG = 0.5
+
+# -- Physical centring after a fix (runner/center_move.py) -------------------
+# Smallest corrected lateral offset from the cell centre worth driving out.
+CAMERA_FIX_LATERAL_MOVE_M = 0.03
+# When to drive it out:
+#   "always"        every fix over the threshold
+#   "before_turns"  only when the next leg starts with a turn of 45 deg or more,
+#                   or at the goal -- a straight next leg already removes the
+#                   offset with its own absolute goto (~6 deg turn1 for 3 cm
+#                   over 30 cm), while centring in place costs two turns
+#   "never"
+CAMERA_FIX_MOVE_POLICY = "before_turns"
+# How: "goto" sends the absolute goto to the centre straight away, which for a
+# mostly-lateral offset is turn ~90, creep, turn ~90 back -- the very turns
+# that create heading error. "backoff" first reverses CAMERA_FIX_BACKOFF_M
+# (gyro-held heading), so the goto approaches the centre at ~15 deg instead.
+CAMERA_FIX_MOVE_MODE = "backoff"
+CAMERA_FIX_BACKOFF_M = 0.12
+# Arrival tolerance of the centring goto, like Leg.ARRIVE_TOLERANCE_M.
+CAMERA_FIX_MOVE_ARRIVE_M = 0.03
+# After the centring move, look again (belief only, never a second move).
+CAMERA_FIX_REVERIFY = True
+
+# -- Diagnostics ------------------------------------------------------------
+# Per-view PNGs (frame, measured contacts, model before/after) and the per-
+# arrival CSV, under maze_solver/logs/.
+CAMERA_FIX_DEBUG_DUMP = True
+ARRIVAL_LOG_ENABLED = True

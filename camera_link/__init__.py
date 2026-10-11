@@ -39,8 +39,17 @@ from camera_link.mjpeg_camera import MjpegCamera
 from camera_link.sim_side_camera import SimSideCamera
 from camera_link.push_frame_to_sensor import push_frame_to_sensor
 from camera_link.camera_mirror import CameraMirror
+# Camera-as-a-sensor pieces of the maze runner's pose fix: calibration, the
+# ideal pinhole, the per-frame wall/floor model and the floor-contact profile.
+from camera_link.camera_calibration import CameraCalibration, ViewCalibration
+from camera_link.pinhole_view import PinholeView
+from camera_link.servo_head import ServoHead
+from camera_link.floor_segmenter import FloorSegmenter
+from camera_link.contact_profile import ContactProfile, extract_contact_profile
 
 __all__ = [
     "FEEDER_HOST", "FEEDER_PORT",
     "MjpegCamera", "SimSideCamera", "push_frame_to_sensor", "CameraMirror",
+    "CameraCalibration", "ViewCalibration", "PinholeView", "ServoHead",
+    "FloorSegmenter", "ContactProfile", "extract_contact_profile",
 ]

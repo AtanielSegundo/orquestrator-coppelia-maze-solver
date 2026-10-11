@@ -95,7 +95,9 @@ def main():
                             args.cell_lenght, ws_url,
                             args.turn_speed, args.drive_speed,
                             video_url, command_url, args.video,
-                            wait_to_step=args.wait_to_step
+                            wait_to_step=args.wait_to_step,
+                            camera_calib_path=args.camera_calib,
+                            camera_fix_enabled=not args.no_camera_fix,
                             )
 
     commands: "queue.Queue" = queue.Queue()
@@ -134,6 +136,8 @@ def main():
                     runner.resume()
                 elif name == "status":
                     print(f"[INFO] {runner.status}")
+                elif name == "camfix":
+                    runner.camera_fix_dry_run()
 
             if pr.is_window_resized():
                 rescale()

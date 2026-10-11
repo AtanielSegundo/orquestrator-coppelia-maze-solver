@@ -1,4 +1,5 @@
 import math
+import os
 import time
 from typing import List, Optional, Tuple
 
@@ -6,24 +7,37 @@ import pyray as pr
 
 import Coppelia.helpers as cop
 from Coppelia.drive import TiredWheel
-from camera_link import CameraMirror
-from shadow import KartLink, SimMirror, grid_heading_to_world_theta, world_theta_to_grid_heading
+from camera_link import CameraMirror, MjpegCamera
+from shadow import (KartLink, SimMirror, grid_heading_to_world_theta,
+                    world_theta_to_grid_heading, wrap)
 
 import src.styles as styles
 from src.renders import HUDView, KartView, MazeView
 from src.solver import solve_bfs, heading_between
 
 from runner.constants import (
-    CAIXA_COR, GRID_HEADING_LABEL, LIVE_RETRY_INTERVAL_S,
+    ARRIVAL_LOG_ENABLED, CAIXA_COR, CAMERA_FIX_AT_START,
+    CAMERA_FIX_DEBUG_DUMP, CAMERA_FIX_ENABLED, CAMERA_FIX_HOLD_TILT,
+    CAMERA_FIX_MOVE_MODE, CAMERA_FIX_REVERIFY, CAMERA_FIX_YAW_GAIN,
+    GRID_HEADING_LABEL, LIVE_RETRY_INTERVAL_S,
     RANGE_FIX_MAX_PREDICTED_M, SCAN_FIT_MIN_SAMPLES,
     OBSTACLE_DISTANCE_CM, SENSOR_CLEAR_CONFIRMATIONS,
     SENSOR_FORWARD_OFFSET_M, SENSOR_FROZEN_TRAVEL_M,
     SWEEP_EVERY_N_LEGS,
 )
+from runner.arrival_log import ArrivalLog, _cm, _deg
+from runner.arrival_policy import MEASURE, START, VERIFY, plan_after_camera
+from runner.camera_fit import REFUSED
+from runner.camera_fix import CameraFix
+from runner.camera_setup import build_view_geometries, load_camera_calibration
+from runner.center_move import CenterMove
 from runner.leg import Leg
 from runner.range_fix import RangeFix, is_trusted_reading, predict_range
 from runner.recenter import Recenter
 from runner.sweep import Sweep, plan_angles
+from runner.wall_world import build_wall_world
+
+_LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
 
 
 class LiveMazeRunner:
@@ -54,7 +68,9 @@ class LiveMazeRunner:
                 cell_length: float, ws_url: str,
                 turn_speed: float, drive_speed: float,
                 video_url: str, command_url: str, 
-                video_backend: str = "sim", wait_to_step: bool = False):
+                video_backend: str = "sim", wait_to_step: bool = False,
+                camera_calib_path: Optional[str] = None,
+                camera_fix_enabled: bool = True):
         self.sim         = sim
         self.kart_base   = kart_base
         self.motors      = motors
@@ -111,9 +127,36 @@ class LiveMazeRunner:
         self.recenter: Optional[Recenter] = None            # physical recentring in flight
         self.sweep: Optional[Sweep]       = None            # angular sweep in flight
         
-        self._legs_since_sweep = 0
+        # Legs since the lateral axis was last measured, by the camera or by a
+        # sweep -- the sweep's cadence gate (SWEEP_EVERY_N_LEGS) counts these,
+        # so a camera fix that measured lateral resets it just like a sweep.
+        self._legs_since_lateral_fix = 0
         self.sweeps_done = 0
         self.last_sweep_summary = ""
+
+        # Camera pose fix (runner/camera_fix.py). One arrival runs:
+        #   CameraFix(medicao) -> [CenterMove -> CameraFix(verificacao)]
+        #   -> Recenter -> Sweep only if the camera produced no lateral.
+        self.video_url = video_url
+        self.camera_fix: Optional[CameraFix] = None
+        self.center_move: Optional[CenterMove] = None
+        self.camera_stream = None
+        self.camera_calib = None
+        self.camera_geoms = None
+        self.camera_source = "desligada"
+        self.last_camera_summary = ""
+        self.camera_fixes_done = 0
+        self._camera_lateral_ok = False
+        self._camera_pending_long = None        # (metres, heading) for Recenter
+        self._needs_start_fix = False
+        self._arrival = None                    # bookkeeping of the arrival in flight
+        self.arrival_log = ArrivalLog(_LOG_DIR, enabled=ARRIVAL_LOG_ENABLED)
+        if camera_fix_enabled and CAMERA_FIX_ENABLED:
+            self.camera_calib, self.camera_source = load_camera_calibration(camera_calib_path)
+            self.camera_geoms = build_view_geometries(self.camera_calib)
+            print(f"[INFO] camera pose fix: calibracao {self.camera_source}")
+        else:
+            print("[INFO] camera pose fix desligado")
 
         # Live-maze bookkeeping for the self-retry loop. `_live_revision` ticks
         # on every discovery and every un-discovery; a holding state compares it
@@ -215,6 +258,16 @@ class LiveMazeRunner:
         self.visited = [self.plan_path[0]]
         self.leg = None
         self.status = "aguardando telemetria..."
+        if self.camera_calib is not None:
+            # A Python-side frame source for the pose fix. The mirror's own
+            # stream is reused when it is one; the "sim" backend decodes inside
+            # CoppeliaSim, so the frames never reach this process.
+            own = getattr(self.camera, "_stream", None)
+            self.camera_stream = own if isinstance(own, MjpegCamera) else MjpegCamera(self.video_url)
+            self._needs_start_fix = CAMERA_FIX_AT_START
+            if CAMERA_FIX_HOLD_TILT:
+                self.camera.set_percents(self.camera_calib.pan_home_pct,
+                                         self.camera_calib.tilt_pct)
 
     # ---- start/goal, valid in both phases ----------------------------------
     def _move_marker(self, name: str, cell):
@@ -302,10 +355,20 @@ class LiveMazeRunner:
         """Move the sim pan/tilt joints by a relative amount (degrees); picked
         up next `step()` and pushed to the real servos too, so the real kart's
         camera shadows whatever the sim joints are set to."""
+        if self.camera_fix is not None:
+            return                  # the pose fix owns the head right now
         self.camera.nudge(d_pan_deg, d_tilt_deg)
 
     def look_forward(self):
-        """Re-center the camera (sim + real) to its calibrated home pose."""
+        """Re-center the camera (sim + real) to its calibrated home pose --
+        at the fix tilt instead of the level one while a run holds it."""
+        if self.camera_fix is not None:
+            return
+        if (self.phase == "live" and self.camera_calib is not None
+                and CAMERA_FIX_HOLD_TILT):
+            self.camera.set_percents(self.camera_calib.pan_home_pct,
+                                     self.camera_calib.tilt_pct)
+            return
         self.camera.look_forward()
 
     # ---- live phase ------------------------------------------------------
@@ -387,12 +450,17 @@ class LiveMazeRunner:
         # stops being in the way.
         self._scan_obstacle(drive_tel, wx, wy, wth)
 
+        # A manual `camfix` is a measurement only, so it runs in any state.
+        if self.camera_fix is not None and self.camera_fix.purpose == "manual":
+            self._poll_camera_fix(drive_tel, pose, wx, wy, wth)
+            return
+
         if self.state in ("blocked", "waiting"):
             self._reconsider_live(wx, wy)
         if self.state != "running":
             return
-        
-        self._advance(drive_tel, wx, wy, wth)
+
+        self._advance(drive_tel, pose, wx, wy, wth)
 
     def _reconsider_live(self, wx, wy):
         now = time.monotonic()
@@ -634,12 +702,39 @@ class LiveMazeRunner:
         elif self.recenter.moved():
             print(f"[INFO] recentragem: {summary}")
 
+        measured = self.recenter.first_error_m is not None
+        if self._arrival is not None:
+            self._arrival["recenter"] = (self.recenter.first_error_m,
+                                         self.recenter.last_error_m,
+                                         self.recenter.attempts)
         self.recenter = None
-        # Longitudinal axis is now as good as the sensor can make it, so hand
-        # over to the sweep for the lateral one. Chained here rather than in
-        # `_advance` so it only runs at a boundary that actually completed its
-        # recentring, never mid-leg.
-        self._start_sweep(wx, wy, wth)
+
+        # The camera's longitudinal was held back so Recenter could drive the
+        # kart onto the belief (runner/arrival_policy.py). If Recenter could
+        # not measure here -- no wall ahead in range -- it is the only
+        # longitudinal evidence there is, so it goes into the belief now.
+        if not measured and self._camera_pending_long is not None:
+            along, th = self._camera_pending_long
+            self.mirror.shift_anchor(math.cos(th) * along, math.sin(th) * along)
+            wx += math.cos(th) * along
+            wy += math.sin(th) * along
+            self._replace_views(wx, wy, wth)
+            print(f"[INFO] camera: longitudinal {along * 100:+.1f} cm aplicado "
+                  f"(recentragem sem leitura)")
+        self._camera_pending_long = None
+
+        # Longitudinal axis is now as good as the sensor can make it. The
+        # lateral one was measured by the camera already, unless it could not
+        # be -- only then does the sweep get its turn. Chained here rather than
+        # in `_advance` so it only runs at a boundary that actually completed
+        # its recentring, never mid-leg.
+        if self._camera_lateral_ok:
+            self._legs_since_lateral_fix = 0
+            return
+        if self._arrival is not None and self._arrival.get("kind") == START:
+            return
+        if self._start_sweep(wx, wy, wth) and self._arrival is not None:
+            self._arrival["sweep_used"] = True
 
     # ---- angular sweep (2-DOF: the lateral axis nothing else sees) --------
     def _start_sweep(self, wx, wy, wth):
@@ -667,14 +762,14 @@ class LiveMazeRunner:
         other one reaches the same accuracy as sweeping unconditionally while
         attempting it 13 times instead of 16 on this path.
         """
-        self._legs_since_sweep += 1
-        if self._legs_since_sweep < SWEEP_EVERY_N_LEGS:
+        self._legs_since_lateral_fix += 1
+        if self._legs_since_lateral_fix < SWEEP_EVERY_N_LEGS:
             return False
         if not self._sweep_worth_trying(wx, wy, wth):
             # Leave the counter standing: the next boundary with geometry should
             # sweep immediately rather than wait out another full interval.
             return False
-        self._legs_since_sweep = 0
+        self._legs_since_lateral_fix = 0
         self.sweep = Sweep(self.view, self.origin, self.cell_length,
                            self.link, wx, wy, wth)
         return True
@@ -745,6 +840,8 @@ class LiveMazeRunner:
         dy = s * along + c * lateral
         self.mirror.shift_anchor(dx, dy)
         self.sweeps_done += 1
+        if self._arrival is not None:
+            self._arrival["sweep_lateral"] = lateral
         gated = "" if longitudinal is not None else " (long nao observavel)"
         print(f"[INFO] varredura #{self.sweeps_done}: {summary}{gated}")
 
@@ -841,7 +938,235 @@ class LiveMazeRunner:
         ox, oy, oth = self.mirror.odom_target(self.odom_ref, tx, ty, wth_target)
         return (tx, ty), (ox, oy, oth)
 
-    def _advance(self, drive_tel, wx, wy, wth):
+    # ---- camera pose fix (lateral + yaw, the axes the sonar cannot see) ----
+    def _camera_ready(self) -> bool:
+        return (self.camera_calib is not None and self.camera_stream is not None
+                and self.mirror is not None and self.odom_ref is not None)
+
+    def _make_camera_fix(self, purpose: str) -> CameraFix:
+        # The wall model is rebuilt per fix so it carries the discoveries made
+        # so far -- only ever as vetoes, never as evidence (see wall_world.py).
+        world = build_wall_world(self.view, self.origin, self.cell_length,
+                                 inset=self.camera_calib.wall_inset_m,
+                                 box_height=self.camera_calib.box_height_m)
+        dump = os.path.join(_LOG_DIR, "camera") if CAMERA_FIX_DEBUG_DUMP else None
+        return CameraFix(self.camera_calib, self.camera_geoms, self.camera,
+                         self.camera_stream, self.link, world, self.odom_ref,
+                         purpose=purpose, dump_dir=dump)
+
+    def camera_fix_dry_run(self) -> bool:
+        """`camfix`: one measurement at the current pose, nothing applied --
+        for checking the camera on the bench without letting it touch a run."""
+        if self.phase != "live" or not self._camera_ready():
+            print("[ERROR] camfix: so ao vivo, com a camera configurada")
+            return False
+        if any(s is not None for s in (self.leg, self.recenter, self.sweep,
+                                       self.camera_fix, self.center_move)):
+            print("[ERROR] camfix: espere o kart parar (perna/correcao em curso)")
+            return False
+        self.camera_fix = self._make_camera_fix("manual")
+        return True
+
+    def _replace_views(self, wx, wy, wth):
+        """Re-place both views right after a correction, so it shows at the
+        boundary instead of as a jump on the next telemetry frame."""
+        self.mirror.apply_world_pose(wx, wy, wth)
+        self.last_world_pose = (wx, wy, wth)
+        self._update_kart_view(wx, wy, wth)
+
+    @staticmethod
+    def _axis_theta(wth: float) -> float:
+        """The grid axis nearest to a heading."""
+        quarter = math.pi / 2.0
+        return round(wth / quarter) * quarter
+
+    def _next_turn_deg(self, wth: float) -> float:
+        """In-place turn the next leg starts with, from the current heading."""
+        if not self.plan_path or self.plan_index + 1 >= len(self.plan_path):
+            return 0.0
+        nxt = grid_heading_to_world_theta(heading_between(
+            self.plan_path[self.plan_index], self.plan_path[self.plan_index + 1]))
+        return math.degrees(abs(wrap(nxt - wth)))
+
+    def _begin_arrival(self, kind: str, wx, wy, wth):
+        """Open the correction chain for a cell: the camera first when it can
+        run, Recenter straight away otherwise (the pre-camera behaviour)."""
+        self._arrival = {"kind": kind, "cell": self._nearest_cell(wx, wy),
+                         "t0": time.monotonic()}
+        self._camera_lateral_ok = False
+        self._camera_pending_long = None
+        if self._camera_ready():
+            self.camera_fix = self._make_camera_fix(START if kind == START else MEASURE)
+            return
+        if kind == START:
+            self._arrival = None            # nothing to correct at the start
+            return
+        self._start_recenter(wx, wy, wth)
+
+    def _lateral_offset_after(self, res, cell) -> float:
+        """Lateral offset of the CORRECTED pose from the cell centre, along the
+        left normal of the capture heading."""
+        fit = res.fit
+        x0, y0, th0 = res.capture_pose
+        c, s = math.cos(th0), math.sin(th0)
+        a = fit.longitudinal or 0.0
+        b = fit.lateral or 0.0
+        px, py = x0 + c * a - s * b, y0 + s * a + c * b
+        cx, cy, _ = cop.cell_to_world(self.origin, self.cell_length, cell)
+        return (px - cx) * -s + (py - cy) * c
+
+    def _poll_camera_fix(self, drive_tel, odom, wx, wy, wth):
+        fix = self.camera_fix
+        outcome = fix.poll(drive_tel, odom, wx, wy, wth)
+        if outcome == "pending":
+            self.status = f"camera: {fix.status}"
+            return
+        self.camera_fix = None
+        res = fix.result
+        self.last_camera_summary = res.summary()
+        if fix.purpose == "manual":
+            print(f"[INFO] camfix (so medida, nada aplicado): {res.summary()}")
+            return
+        print(f"[INFO] camera ({fix.purpose}): {res.summary()}")
+
+        arrival = self._arrival if self._arrival is not None else {}
+        cell = arrival.get("cell", self._nearest_cell(wx, wy))
+        arrival["verify" if fix.purpose == VERIFY else "camera"] = res
+        fit = res.fit
+        if fit is not None and fit.outcome != REFUSED and fit.lateral is not None:
+            self._camera_lateral_ok = True
+        offset = (self._lateral_offset_after(res, cell)
+                  if fit is not None and fit.lateral is not None else 0.0)
+        at_goal = not self.plan_path or self.plan_index + 1 >= len(self.plan_path)
+        decision = plan_after_camera(fit, offset, fix.purpose,
+                                     self._next_turn_deg(wth), at_goal)
+        wx, wy, wth = self._apply_camera_fix(res, decision, odom)
+
+        if decision.move:
+            self.center_move = CenterMove(self.link, self.mirror, self.odom_ref,
+                                          self.view, self.origin, self.cell_length,
+                                          cell, self._axis_theta(wth),
+                                          mode=CAMERA_FIX_MOVE_MODE)
+            arrival["moved"] = True
+            arrival["move_mode"] = self.center_move.mode
+            print(f"[INFO] camera: kart a {offset * 100:+.1f} cm do eixo -- "
+                  f"centralizando ({self.center_move.mode})")
+            return
+        self._start_recenter(wx, wy, wth)
+
+    def _apply_camera_fix(self, res, decision, odom):
+        """Re-anchor the belief with what the decision allows, stash the
+        longitudinal for Recenter when it says so. Returns the corrected pose.
+
+        Through `reanchor`, not `shift_anchor`: the yaw is corrected too, and a
+        heading change must rotate every FUTURE relative motion about the
+        CAPTURE point -- the pose all three components were measured at.
+        """
+        fit = res.fit
+        if fit is not None and res.capture_pose is not None:
+            x0, y0, th0 = res.capture_pose
+            a = fit.longitudinal if decision.apply_long_now else 0.0
+            b = fit.lateral if decision.apply_lat else 0.0
+            psi = CAMERA_FIX_YAW_GAIN * fit.yaw if decision.apply_yaw else 0.0
+            if a or b or psi:
+                c, s = math.cos(th0), math.sin(th0)
+                corrected = (x0 + c * a - s * b, y0 + s * a + c * b, th0 + psi)
+                self.mirror.reanchor(res.capture_rel, corrected)
+                self.camera_fixes_done += 1
+            if decision.stash_long:
+                self._camera_pending_long = (fit.longitudinal, th0)
+        wx, wy, wth = self.mirror.world_pose(odom, self.odom_ref)
+        self._replace_views(wx, wy, wth)
+        return wx, wy, wth
+
+    def _poll_center_move(self, drive_tel, wx, wy, wth):
+        outcome = self.center_move.poll(drive_tel, wx, wy)
+        if outcome == "pending":
+            self.status = f"centralizando: {self.center_move.status}"
+            return
+        status = self.center_move.status
+        self.center_move = None
+        if self._arrival is not None:
+            self._arrival["move_blocked"] = outcome == "blocked"
+        if outcome == "blocked":
+            print(f"[WARN] centralizacao: {status}")
+        elif CAMERA_FIX_REVERIFY and self._camera_ready():
+            self.camera_fix = self._make_camera_fix(VERIFY)
+            return
+        self._start_recenter(wx, wy, wth)
+
+    def _finalize_arrival(self):
+        """Close the arrival: one CSV row with the best estimate of how far
+        from the cell centre the kart actually was when it arrived."""
+        arr, self._arrival = self._arrival, None
+        if arr is None:
+            return
+        cell = arr["cell"]
+        cx, cy, _ = cop.cell_to_world(self.origin, self.cell_length, cell)
+        row = {"t": time.strftime("%H:%M:%S"), "kind": arr["kind"],
+               "cell": f"{cell[0]}_{cell[1]}",
+               "duration_s": f"{time.monotonic() - arr['t0']:.1f}",
+               "moved": "1" if arr.get("moved") else "",
+               "move_mode": arr.get("move_mode", ""),
+               "move_blocked": "1" if arr.get("move_blocked") else "",
+               "sweep_used": "1" if arr.get("sweep_used") else "",
+               "sweep_lateral_cm": _cm(arr.get("sweep_lateral"))}
+        first, last, moves = arr.get("recenter", (None, None, ""))
+        row.update(recenter_first_cm=_cm(first), recenter_last_cm=_cm(last),
+                   recenter_moves=moves)
+        res = arr.get("camera")
+        err_long = err_lat = None
+        if res is not None:
+            row.update(cam_outcome=res.outcome, cam_reason=res.reason)
+        if res is not None and res.fit is not None and res.capture_pose is not None:
+            fit = res.fit
+            x0, y0, th0 = res.capture_pose
+            row.update(heading_deg=f"{math.degrees(th0):.1f}",
+                       cam_views="+".join(fit.views), cam_hits=fit.n_hits,
+                       cam_rms_px=f"{fit.rms_px:.2f}" if math.isfinite(fit.rms_px) else "",
+                       cam_long_cm=_cm(fit.longitudinal), cam_lat_cm=_cm(fit.lateral),
+                       cam_yaw_deg=_deg(fit.yaw), cam_std_long_cm=_cm(fit.std[0]),
+                       cam_std_lat_cm=_cm(fit.std[1]), cam_std_yaw_deg=_deg(fit.std[2]))
+            ax = self._axis_theta(th0)
+            ca, sa = math.cos(ax), math.sin(ax)
+            c, s = math.cos(th0), math.sin(th0)
+            a, b = fit.longitudinal, fit.lateral
+            px = x0 + c * (a or 0.0) - s * (b or 0.0)
+            py = y0 + s * (a or 0.0) + c * (b or 0.0)
+            along = (px - cx) * ca + (py - cy) * sa
+            across = (px - cx) * -sa + (py - cy) * ca
+            if b is not None:
+                err_lat = across
+            if a is not None:
+                err_long = along
+                row["err_long_source"] = "camera"
+            elif first is not None and not arr.get("moved"):
+                # Recenter's error is "how far to drive forward to reach the
+                # belief", measured from the same spot: the kart sat that much
+                # BEHIND it.
+                err_long = along - first
+                row["err_long_source"] = "sonar"
+        verify = arr.get("verify")
+        if verify is not None:
+            row["verify_outcome"] = verify.outcome
+            if verify.fit is not None:
+                row["verify_lat_cm"] = _cm(verify.fit.lateral)
+                row["verify_yaw_deg"] = _deg(verify.fit.yaw)
+        row["err_long_cm"] = _cm(err_long)
+        row["err_lat_cm"] = _cm(err_lat)
+        if err_long is not None and err_lat is not None:
+            row["err_xy_cm"] = _cm(math.hypot(err_long, err_lat))
+        self.arrival_log.record(row)
+
+    def _advance(self, drive_tel, odom, wx, wy, wth):
+        # The camera fix and the centring move own the kart (and the head)
+        # while they run, exactly like Recenter and the sweep below.
+        if self.camera_fix is not None:
+            self._poll_camera_fix(drive_tel, odom, wx, wy, wth)
+            return
+        if self.center_move is not None:
+            self._poll_center_move(drive_tel, wx, wy, wth)
+            return
         # A recentring session owns the kart while it runs: it is issuing its
         # own drive_distance commands, so the next leg must not be started on
         # top of them. Checked before anything else for that reason.
@@ -855,11 +1180,22 @@ class LiveMazeRunner:
             return
 
         if self.leg is None:
+            # Every correction of the last arrival has finished by now (each
+            # returned above while it ran), so this is where it is logged.
+            if self._arrival is not None:
+                self._finalize_arrival()
+            if self._needs_start_fix:
+                # Before the first leg: correct the operator's placement.
+                self._needs_start_fix = False
+                self._begin_arrival(START, wx, wy, wth)
+                return
             if self.replan_requested:
                 self._replan_live(self._nearest_cell(wx, wy))
                 if self.state != "running":
                     return
             if not self.plan_path or self.plan_index + 1 >= len(self.plan_path):
+                if self.state != "idle" and self.arrival_log.rows:
+                    print(f"[INFO] chegadas: {self.arrival_log.summary()}")
                 self.state = "idle"
                 reached = self.plan_path[-1] if self.plan_path else "?"
                 self.status = f"GOAL alcancado em {reached}"
@@ -896,10 +1232,11 @@ class LiveMazeRunner:
             self.visited.append(self.leg.to_cell)
             self.plan_index += 1
             self.leg = None
-            # Recentre HERE, between legs: the kart is stationary, the odometry
-            # has settled, and the next leg is only built once this finishes --
-            # so it starts from the corrected position.
-            self._start_recenter(wx, wy, wth)
+            # Correct HERE, between legs: the kart is stationary, the odometry
+            # has settled, and the next leg is only built once the chain
+            # (camera -> [centring] -> Recenter -> [sweep]) finishes -- so it
+            # starts from the corrected position.
+            self._begin_arrival(MEASURE, wx, wy, wth)
             return
 
         # "blocked" -- a holding state, not a dead end: _reconsider_live() will
@@ -961,10 +1298,18 @@ class LiveMazeRunner:
         # from being an invisible process nudging the pose behind the operator's
         # back. Slip is on the same line because it is the main reason the fix
         # holds off.
-        if self.recenter is not None:
+        if self.camera_fix is not None:
+            fix_line = f"camera: {self.camera_fix.status}"
+        elif self.center_move is not None:
+            fix_line = f"centralizando: {self.center_move.status}"
+        elif self.recenter is not None:
             fix_line = f"recentrando: {self.recenter.status}"
         elif self.sweep is not None:
             fix_line = f"varredura: {self.sweep.status}"
+        elif self.last_camera_summary:
+            # The camera is what corrects the lateral axis now, once per cell;
+            # its last result stays up until the next one replaces it.
+            fix_line = f"camera ({self.camera_fixes_done}x): {self.last_camera_summary}"
         elif self.last_sweep_summary:
             # The sweep is the only thing correcting the lateral axis, and it
             # runs every few legs rather than continuously, so its last result
@@ -1018,6 +1363,10 @@ class LiveMazeRunner:
         pr.end_drawing()
 
     def stop(self):
+        if self.camera_stream is not None and self.camera_stream is not getattr(self.camera, "_stream", None):
+            self.camera_stream.stop()
         self.camera.stop()
         if self.link is not None:
             self.link.stop()
+        if self.arrival_log.rows:
+            print(f"[INFO] chegadas: {self.arrival_log.summary()}")

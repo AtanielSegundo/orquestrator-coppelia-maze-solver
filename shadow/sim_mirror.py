@@ -81,6 +81,28 @@ class SimMirror:
         x0, y0, th0 = self.initial
         self.initial = (x0 + dx, y0 + dy, th0)
 
+    def reanchor(self, rel, corrected_world_pose) -> None:
+        """Move the anchor so that `world_pose` of the odometry sample whose
+        relative motion is `rel` comes out as `corrected_world_pose` exactly.
+
+        `world_pose` is compose(initial, rel), so the anchor that does that is
+        compose(corrected, inverse(rel)). A pure translation is exactly
+        `shift_anchor`. A heading change additionally rotates every FUTURE
+        relative motion about the current position, which is the persistent
+        form of "the gyro's yaw is off by this much": the next leg's odometry
+        is laid down along the corrected heading instead of the drifted one.
+
+        `rel` must be the motion at the moment the correction was MEASURED (see
+        `relative`), not the latest one -- the camera fix freezes its pose at
+        capture, and the kart may only be presumed still since then.
+        """
+        self.initial = compose(corrected_world_pose, inverse(rel))
+
+    @staticmethod
+    def relative(odom_pose, odom_ref):
+        """Motion since the first odometry sample, in that sample's frame."""
+        return compose(inverse(odom_ref), odom_pose)
+
     def world_pose(self, odom_pose, odom_ref):
         """Odom telemetry pose -> world (x, y, theta) of the kart's CENTER,
         relative to the first odom sample (odom_ref) and anchored to the
