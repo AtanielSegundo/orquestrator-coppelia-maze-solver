@@ -7,20 +7,23 @@ import pyray as pr
 import Coppelia.helpers as cop
 from Coppelia.drive import TiredWheel
 from camera_link import CameraMirror
-from shadow import KartLink, SimMirror, grid_heading_to_world_theta, world_theta_to_grid_heading
+from shadow import (KartLink, SimMirror, grid_heading_to_world_theta,
+                    world_theta_to_grid_heading, wrap)
 
 import src.styles as styles
 from src.renders import HUDView, KartView, MazeView
-from src.solver import solve_bfs, heading_between
+from src.solver import DIRECTIONS, solve_bfs, heading_between
 
 from runner.constants import (
     CAIXA_COR, GRID_HEADING_LABEL, LIVE_RETRY_INTERVAL_S,
     RANGE_FIX_MAX_PREDICTED_M, SCAN_FIT_MIN_SAMPLES,
     OBSTACLE_DISTANCE_CM, SENSOR_CLEAR_CONFIRMATIONS,
     SENSOR_FORWARD_OFFSET_M, SENSOR_FROZEN_TRAVEL_M,
-    SWEEP_EVERY_N_LEGS,
+    OBSTACLE_HIT_DEPTH_M, OBSTACLE_ALIGN_TOLERANCE_DEG,
+    OBSTACLE_STEADY_SPEED_MPS, OBSTACLE_CONFIRM_S, OBSTACLE_SUSPECT_TIMEOUT_S,
+    SWEEP_EVERY_N_LEGS, LEG_MAX_CELLS,
 )
-from runner.leg import Leg
+from runner.leg import Leg, run_heading, straight_run_end
 from runner.range_fix import RangeFix, is_trusted_reading, predict_range
 from runner.recenter import Recenter
 from runner.sweep import Sweep, plan_angles
@@ -111,9 +114,21 @@ class LiveMazeRunner:
         self.recenter: Optional[Recenter] = None            # physical recentring in flight
         self.sweep: Optional[Sweep]       = None            # angular sweep in flight
         
-        self._legs_since_sweep = 0
+        self._cells_since_sweep = 0     # cells, not legs -- see SWEEP_EVERY_N_LEGS
         self.sweeps_done = 0
         self.last_sweep_summary = ""
+
+        # Obstacle confirmation (see _scan_obstacle). `_ahead_verdict` is the
+        # running ((cell, blocked), since) a steady kart is accumulating about
+        # the cell in front of it. `_suspect` is a cell a moving leg was
+        # stopped short of, held until that verdict (or the timeout) settles
+        # it; `_dismissed` holds suspects that did not confirm, so the leg
+        # driven right after the hold does not stop for them again.
+        self._ahead_verdict = None
+        self._suspect: Optional[Tuple[int, int]] = None
+        self._suspect_verdict: Optional[str] = None     # "blocked" | "clear"
+        self._suspect_deadline: Optional[float] = None
+        self._dismissed = set()
 
         # Live-maze bookkeeping for the self-retry loop. `_live_revision` ticks
         # on every discovery and every un-discovery; a holding state compares it
@@ -382,10 +397,14 @@ class LiveMazeRunner:
         # Cached for the HUD, and consulted by both the obstacle scan and the
         # range fix. Empty against a kart whose server predates the detector.
         self._last_slip = drive_tel.get("slip") or {}
+        # Nothing commanded AND the wheels actually stopped: the only state in
+        # which a reading is allowed to block a cell (see _scan_obstacle).
+        steady = (not drive_tel.get("goal_active")
+                  and max(abs(wheel[0]), abs(wheel[1])) < OBSTACLE_STEADY_SPEED_MPS)
         # Runs even while blocked/waiting -- a stopped run is exactly when you
         # most want to learn what is actually in the way, and (now) when it
         # stops being in the way.
-        self._scan_obstacle(drive_tel, wx, wy, wth)
+        self._scan_obstacle(drive_tel, wx, wy, wth, steady)
 
         if self.state in ("blocked", "waiting"):
             self._reconsider_live(wx, wy)
@@ -452,57 +471,68 @@ class LiveMazeRunner:
                 return False
         return True
 
-    def _scan_obstacle(self, drive_tel, wx, wy, wth):
+    def _scan_obstacle(self, drive_tel, wx, wy, wth, steady):
         """Front distance sensor <-> LIVE maze, in BOTH directions.
 
-        A reading says two things and the run needs both. The far end is an
-        obstacle: whichever cell it falls in gets blocked, so the next replan
-        routes around it. Everything the beam passed THROUGH on the way there
-        is empty -- it would have stopped earlier otherwise -- so any cell in
-        that span previously discovered blocked gets un-discovered.
+        Runs every frame, moving or not. A reading says three things:
 
-        That second half is what makes the run live. Discoveries used to be
-        write-only, so a cell that closed the last route stayed closed until
-        somebody typed 'resume'. Now taking the box off the floor is enough:
-        the next sweep of that corridor reads long, the cell goes back to open,
-        and the planner finds the route it had lost.
+        * Everything the beam passed THROUGH is empty -- it would have stopped
+          earlier otherwise -- so any cell in that span previously discovered
+          blocked gets un-discovered (`_carve_free`). Live, at any time: that
+          is what lets a run resume by itself once a box is taken off the
+          floor, without anybody typing 'resume'.
+        * While a leg is driving, a hit on a cell that leg is about to enter
+          makes it a SUSPECT, and the kart is stopped short of it, in the cell
+          before (`_check_suspect`). Nothing is marked yet.
+        * A STEADY kart, facing a grid axis, gets to judge the ONE cell right
+          in front of it: blocked if the hit lands there, clear if the beam
+          went past it (`_judge_ahead`). That is the only place a cell is ever
+          marked.
+
+        Why not mark wherever the beam lands, as this used to: a hit two cells
+        out, from a moving kart, is projected through a pose that is still
+        integrating the move, along a heading that may be mid-turn -- one
+        frame of that is enough to block a corridor that is open. A steady
+        kart one cell away has neither problem, and a wrong verdict there
+        would need the obstacle to be somewhere the beam physically cannot
+        miss.
+
+        The hit is projected rather than blindly blamed on the next cell: it
+        comes from the sensor, which sits SENSOR_FORWARD_OFFSET_M ahead of the
+        tracked center, so adding that back and walking the measured distance
+        along the current heading lands on whichever cell the obstacle is
+        really in. The cell it is BLAMED on is taken OBSTACLE_HIT_DEPTH_M
+        further on (the reading is the near face; see constants.py).
 
         The .maze file's own copy is never touched in either direction (see
         MazeView's original-vs-live split), so the original stays the reference
         for what was there to begin with -- and a wall that came from the file
         is never something a reading gets to erase.
 
-        The hit is projected rather than blindly blamed on the next cell: it
-        comes from the sensor, which sits SENSOR_FORWARD_OFFSET_M ahead of the
-        tracked center, so adding that back and walking the measured distance
-        along the current heading lands on whichever cell the obstacle is
-        really in -- one cell ahead or two.
-
         Suspended while the kart reports slipping. The reading itself is fine
         -- the ultrasonic does not care what the wheels are doing -- but the
         POSE it gets projected through was integrated from those slipping
-        wheels, so the hit lands in the wrong cell. Writing that into the live
-        maze is worse than writing nothing: it blocks a cell that is actually
-        clear, and the un-discovery path then has to walk it back over
-        SENSOR_CLEAR_CONFIRMATIONS frames. Carving free is suspended for the
-        same reason -- a mislocated beam would erase a real obstacle."""
+        wheels, so the hit lands in the wrong cell."""
         if self._last_slip.get("slipping"):
+            self._ahead_verdict = None
             return
         dist_cm = drive_tel.get("front_distance_cm")
-        if dist_cm is None:
-            return
         try:
             dist_cm = float(dist_cm)
         except (TypeError, ValueError):
-            return
-        if dist_cm <= 0.0:
+            dist_cm = None
+        if dist_cm is None or dist_cm <= 0.0:
+            # No measurement is not "clear": the verdict has to be built from
+            # readings, so a gap in them starts it over.
+            self._ahead_verdict = None
             return
 
-        # Frozen readings gate BOTH halves: a stuck sensor must not be allowed
+        # Frozen readings gate everything: a stuck sensor must not be allowed
         # to erase obstacles any more than it is allowed to invent them.
         if dist_cm == self._dist_seen_value and self._dist_seen_pose is not None:
             px, py = self._dist_seen_pose
             if math.hypot(wx - px, wy - py) > SENSOR_FROZEN_TRAVEL_M:
+                self._ahead_verdict = None
                 return
         else:
             self._dist_seen_value = dist_cm
@@ -515,19 +545,81 @@ class LiveMazeRunner:
             self._carve_free(wx, wy, wth,
                              SENSOR_FORWARD_OFFSET_M + OBSTACLE_DISTANCE_CM / 100.0,
                              hit_cell=None)
+            self._judge_ahead(None, steady, wx, wy, wth, dist_cm)
             return
 
         reach = SENSOR_FORWARD_OFFSET_M + dist_cm / 100.0
-        hx = wx + math.cos(wth) * reach
-        hy = wy + math.sin(wth) * reach
-        rf, cf = cop.world_to_cell(self.origin, self.cell_length, hx, hy)
-        cell = (round(rf), round(cf))
+        # Carve against the face itself, not the deeper blamed cell: a face
+        # projected just short of a boundary may be the next cell's obstacle,
+        # and carving that cell free on it would erase what is really there.
+        self._carve_free(wx, wy, wth, reach,
+                         hit_cell=self._project(wx, wy, wth, reach))
 
-        # Carve first: it only ever opens cells up, so the line-of-sight test
-        # below judges the hit against what the beam just proved
-        self._carve_free(wx, wy, wth, reach, hit_cell=cell)
+        cell = self._project(wx, wy, wth, reach + OBSTACLE_HIT_DEPTH_M)
+        self._check_suspect(cell, wx, wy, wth)
+        self._judge_ahead(cell, steady, wx, wy, wth, dist_cm)
 
-        if not self._obstacle_scaned_is_valid(wx,wy,wth,cell):
+    def _project(self, wx, wy, wth, reach) -> Tuple[int, int]:
+        """The cell `reach` metres ahead of the kart's center, along wth."""
+        rf, cf = cop.world_to_cell(self.origin, self.cell_length,
+                                   wx + math.cos(wth) * reach,
+                                   wy + math.sin(wth) * reach)
+        return (round(rf), round(cf))
+
+    def _cell_ahead(self, wx, wy, wth) -> Optional[Tuple[int, int]]:
+        """The neighbour of the kart's cell that it is facing, or None when
+        the heading is not within OBSTACLE_ALIGN_TOLERANCE_DEG of a grid axis
+        (then it is not facing any one cell)."""
+        heading = world_theta_to_grid_heading(wth)
+        axis = (round(heading / 90.0) * 90.0) % 360.0
+        if abs((heading - axis + 180.0) % 360.0 - 180.0) > OBSTACLE_ALIGN_TOLERANCE_DEG:
+            return None
+        r, c = self._nearest_cell(wx, wy)
+        for dr, dc, grid_heading in DIRECTIONS:
+            if grid_heading == axis:
+                return (r + dr, c + dc)
+        return None
+
+    def _judge_ahead(self, cell, steady, wx, wy, wth, dist_cm):
+        """The only place a reading BLOCKS a cell: the kart is steady in
+        (r, c), facing a grid axis, and the hit lands in the very next cell
+        along it. `cell` is the blamed cell of this reading, or None when
+        nothing was in range.
+
+        The verdict -- that cell blocked, or that cell clear because the beam
+        went past it -- has to hold for OBSTACLE_CONFIRM_S of continuous
+        steadiness before anything acts on it. Blocked marks it; either way
+        it settles a pending suspect for that cell (see _hold_for_suspect)."""
+        ahead = self._cell_ahead(wx, wy, wth) if steady else None
+        if ahead is None or not self.view.in_bounds(ahead):
+            self._ahead_verdict = None
+            return
+        if cell == ahead:
+            blocked = True
+        elif cell is None or cell != self._nearest_cell(wx, wy):
+            blocked = False
+        else:
+            # Hit inside the kart's own cell: too close to say anything about
+            # the next one.
+            self._ahead_verdict = None
+            return
+
+        now = time.monotonic()
+        verdict = (ahead, blocked)
+        if self._ahead_verdict is None or self._ahead_verdict[0] != verdict:
+            self._ahead_verdict = (verdict, now)
+            return
+        if now - self._ahead_verdict[1] < OBSTACLE_CONFIRM_S:
+            return
+
+        if blocked:
+            self._discover(ahead, wx, wy, wth, dist_cm)
+        if ahead == self._suspect and self._suspect_verdict is None:
+            self._suspect_verdict = "blocked" if blocked else "clear"
+
+    def _discover(self, cell, wx, wy, wth, dist_cm):
+        """Block `cell` in the live maze and the Coppelia scene, once."""
+        if not self._obstacle_scaned_is_valid(wx, wy, wth, cell):
             return
 
         self._live_revision += 1
@@ -543,6 +635,86 @@ class LiveMazeRunner:
 
         if cell in self.plan_path:
             self.replan_requested = True
+
+    # ---- suspects: stop short, then let the steady check decide ------------
+    def _check_suspect(self, cell, wx, wy, wth):
+        """A hit on a cell the running leg is about to enter: stop the kart
+        in the cell before it, so the steady check can look at it from there.
+
+        Only once the kart is on the run's heading. While it is still turning
+        onto it the beam sweeps across cells at an angle, and a hit there says
+        nothing about the corridor the kart is going to drive."""
+        leg = self.leg
+        if leg is None or self._suspect is not None or cell in self._dismissed:
+            return
+        if abs(math.degrees(wrap(wth - leg.target_theta))) > OBSTACLE_ALIGN_TOLERANCE_DEG:
+            return
+        first = self.plan_index + 1
+        route = self.plan_path[first:first + leg.n_cells]
+        if cell not in route:
+            return
+        origin = self._nearest_cell(wx, wy)
+        # Same gates as marking (_obstacle_scaned_is_valid), minus the mark.
+        if (cell == origin or cell == self.goal_cell or self.view.is_wall(cell)
+                or not self._has_line_of_sight(origin, cell)):
+            return
+        self._stop_short_of(cell, first + route.index(cell) - 1, wx, wy)
+
+    def _stop_short_of(self, suspect, approach_index, wx, wy):
+        """End the running leg on plan_path[approach_index], the cell right
+        before `suspect`.
+
+        Still behind that cell: the leg is cut short in flight and the kart
+        drives on to its centre (Leg.retarget) -- one smooth stop, facing the
+        suspect, already where the steady check needs it. Already inside it:
+        stop right there, since aiming a goto at a centre the kart has passed
+        would turn it around to reach it."""
+        approach = self.plan_path[approach_index]
+        self._suspect = suspect
+        self._suspect_verdict = None
+        self._suspect_deadline = None
+
+        if (approach_index > self.plan_index
+                and self._nearest_cell(wx, wy) != approach):
+            target_world, odom_target = self._leg_target(approach)
+            self.leg.retarget(self.link, approach, wx, wy,
+                              target_world=target_world, odom_target=odom_target)
+            self.status = f"{self.leg.from_cell} -> {approach} (suspeita em {suspect})"
+            print(f"[WARN] possivel obstaculo em {suspect} -- parando antes, em {approach}")
+            return
+
+        self.link.halt()
+        self._advance_plan(approach_index - self.plan_index)
+        self.leg = None
+        print(f"[WARN] possivel obstaculo em {suspect} -- parando em {approach}")
+
+    def _hold_for_suspect(self) -> bool:
+        """Keep the kart parked until the steady check settles the suspect.
+        True once it is settled (or timed out) and the run may go on."""
+        now = time.monotonic()
+        if self._suspect_deadline is None:
+            self._suspect_deadline = now + OBSTACLE_SUSPECT_TIMEOUT_S
+        verdict = self._suspect_verdict
+        if verdict is None and now < self._suspect_deadline:
+            self.status = f"parado: confirmando possivel obstaculo em {self._suspect}"
+            return False
+
+        cell, self._suspect = self._suspect, None
+        if verdict == "blocked" and self.view.is_wall(cell):
+            # _discover already logged it and asked for the replan.
+            return True
+        # Not confirmed: drive on, and do not stop for it again on the way.
+        self._dismissed.add(cell)
+        why = "livre" if verdict == "clear" else "sem leitura conclusiva"
+        print(f"[INFO] {cell}: {why} -- seguindo")
+        return True
+
+    def _advance_plan(self, cells):
+        """The kart is now `cells` further along plan_path."""
+        first = self.plan_index + 1
+        self.visited.extend(self.plan_path[first:first + cells])
+        self.plan_index += cells
+        self._cells_since_sweep += cells
 
     def _carve_free(self, wx, wy, wth, length, hit_cell):
         """Un-discover the cells this reading just proved empty.
@@ -654,7 +826,8 @@ class LiveMazeRunner:
 
         Two gates, and the second one matters more than it looks:
 
-        `SWEEP_EVERY_N_LEGS` is a floor on the interval, not a target. Driving
+        `SWEEP_EVERY_N_LEGS` is a floor on the interval -- in cells driven,
+        since a leg can now span several (see _advance_plan) -- not a target. Driving
         it purely on a leg count was measured to be fragile on tcc.maze -- WHICH
         cells the count lands on decides the outcome, so a cadence of 2 came out
         WORSE than 3 (12.8 cm vs 4.8 cm worst lateral error) purely by landing
@@ -667,14 +840,13 @@ class LiveMazeRunner:
         other one reaches the same accuracy as sweeping unconditionally while
         attempting it 13 times instead of 16 on this path.
         """
-        self._legs_since_sweep += 1
-        if self._legs_since_sweep < SWEEP_EVERY_N_LEGS:
+        if self._cells_since_sweep < SWEEP_EVERY_N_LEGS:
             return False
         if not self._sweep_worth_trying(wx, wy, wth):
             # Leave the counter standing: the next boundary with geometry should
             # sweep immediately rather than wait out another full interval.
             return False
-        self._legs_since_sweep = 0
+        self._cells_since_sweep = 0
         self.sweep = Sweep(self.view, self.origin, self.cell_length,
                            self.link, wx, wy, wth)
         return True
@@ -835,8 +1007,9 @@ class LiveMazeRunner:
             return None, None
         # The heading is commanded too: goto's third phase settles it gyro-
         # closed when a gyro is present, which beats this side's open-loop
-        # turn chunks at the same job.
-        heading = heading_between(self.plan_path[self.plan_index], to_cell)
+        # turn chunks at the same job. `to_cell` may be several cells down a
+        # straight run, so it is the run's heading, not a neighbour's.
+        heading = run_heading(self.plan_path[self.plan_index], to_cell)
         wth_target = grid_heading_to_world_theta(heading)
         ox, oy, oth = self.mirror.odom_target(self.odom_ref, tx, ty, wth_target)
         return (tx, ty), (ox, oy, oth)
@@ -854,6 +1027,14 @@ class LiveMazeRunner:
             self._poll_sweep(drive_tel, wx, wy, wth)
             return
 
+        # Stopped short of a suspect: parked until the steady check settles
+        # it, and only then the usual arrival work (recentre -> sweep). Before
+        # the replan on purpose -- a confirmed obstacle is what asks for it.
+        if self.leg is None and self._suspect is not None:
+            if self._hold_for_suspect():
+                self._start_recenter(wx, wy, wth)
+            return
+
         if self.leg is None:
             if self.replan_requested:
                 self._replan_live(self._nearest_cell(wx, wy))
@@ -865,7 +1046,10 @@ class LiveMazeRunner:
                 self.status = f"GOAL alcancado em {reached}"
                 return
             frm = self.plan_path[self.plan_index]
-            to = self.plan_path[self.plan_index + 1]
+            # A straight stretch is one leg: one goto to the far centre, no
+            # stop on the cells in between (see LEG_MAX_CELLS).
+            to = self.plan_path[straight_run_end(self.plan_path, self.plan_index,
+                                                 LEG_MAX_CELLS)]
 
             # Gate AFTER recentring/sweep (they returned above) and the replan,
             # so the operator releases the leg that will really be driven, from
@@ -893,9 +1077,14 @@ class LiveMazeRunner:
             return
         
         if outcome == "arrived":
-            self.visited.append(self.leg.to_cell)
-            self.plan_index += 1
+            self._advance_plan(self.leg.n_cells)
             self.leg = None
+            # The kart has driven past whatever it decided to ignore.
+            self._dismissed.clear()
+            # Cut short in front of a suspect: the hold at the top of this
+            # method takes over, and recentres once the suspect is settled.
+            if self._suspect is not None:
+                return
             # Recentre HERE, between legs: the kart is stationary, the odometry
             # has settled, and the next leg is only built once this finishes --
             # so it starts from the corrected position.

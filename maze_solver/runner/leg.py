@@ -58,6 +58,16 @@ A kart whose server predates `goto` would silently never move, so `relative=True
 restores the turn-then-drive path verbatim. It is also what runs when a caller
 cannot supply the target in both frames (see `__init__`), and what the unit
 tests drive to keep the legacy semantics pinned.
+
+Straight runs
+-------------
+A leg is not limited to neighbouring cells: `to_cell` may be any cell on the
+same row or column as `from_cell`, and the leg drives the whole run as one
+move (see `straight_run_end` for how the runner picks it). Stopping at every
+cell centre on a straight corridor buys nothing -- the target is absolute, so
+one goto to the far centre lands just as well -- and costs a stop and a
+restart per cell. `retarget` cuts a run short in flight, which is how the
+runner stops the kart in front of a suspected obstacle.
 """
 import math
 import time
@@ -65,6 +75,39 @@ import time
 from shadow import KartLink, wrap, grid_heading_to_world_theta
 
 from src.solver import heading_between
+
+
+def run_cells(from_cell, to_cell) -> int:
+    """Cells crossed by a straight run (1 for neighbours)."""
+    dr = to_cell[0] - from_cell[0]
+    dc = to_cell[1] - from_cell[1]
+    if dr and dc:
+        raise ValueError(f"{from_cell} -> {to_cell} is not a straight run")
+    return abs(dr) + abs(dc)
+
+
+def run_heading(from_cell, to_cell):
+    """Grid heading of a straight run -- the heading of its first step."""
+    n = run_cells(from_cell, to_cell)
+    if n == 0:
+        return None
+    step = ((to_cell[0] - from_cell[0]) // n, (to_cell[1] - from_cell[1]) // n)
+    return heading_between(from_cell, (from_cell[0] + step[0],
+                                       from_cell[1] + step[1]))
+
+
+def straight_run_end(path, start: int, max_cells: int) -> int:
+    """Index of the last cell of the straight run leaving `path[start]`.
+
+    Extends while the path keeps the heading of its first step, up to
+    `max_cells` steps; a longer corridor is left for the next leg. Needs at
+    least one step after `start`."""
+    heading = heading_between(path[start], path[start + 1])
+    end = start + 1
+    while (end + 1 < len(path) and end - start < max(1, max_cells)
+           and heading_between(path[end], path[end + 1]) == heading):
+        end += 1
+    return end
 
 
 class Leg:
@@ -134,7 +177,8 @@ class Leg:
         self.relative = (relative or target_world is None
                          or odom_target is None)
 
-        grid_heading = heading_between(from_cell, to_cell)
+        self.n_cells = run_cells(from_cell, to_cell)
+        grid_heading = run_heading(from_cell, to_cell)
         self.target_theta = grid_heading_to_world_theta(grid_heading)
         self._turn_delta = math.degrees(wrap(self.target_theta - current_world_theta))
         self._turn_left = self._turn_delta   # signed degrees still to be issued
@@ -206,6 +250,39 @@ class Leg:
         if step is None or step <= 0:
             return left
         return math.copysign(min(step, abs(left)), left)
+
+    def retarget(self, link: KartLink, to_cell, wx: float, wy: float,
+                 target_world=None, odom_target=None) -> None:
+        """End the leg on `to_cell` instead: an earlier cell of the same run,
+        still AHEAD of the kart (the caller checks -- an absolute goto aimed
+        behind the kart would turn it around to get there).
+
+        Whatever is already in flight is re-issued against the new end: the
+        server replaces a running goto or move with the new one, so the kart
+        slows onto the nearer centre instead of stopping and restarting. A
+        phase not issued yet (a pre-turn chunk still running) needs nothing --
+        it reads the new end when it does issue.
+        """
+        self.to_cell = to_cell
+        self.n_cells = run_cells(self.from_cell, to_cell)
+        if not self.relative:
+            self.target_world = target_world
+            self.odom_target = odom_target
+        if not self._issued or self.phase == "turn":
+            return
+        if self.phase == "goto":
+            link.goto(*self.odom_target)
+        else:
+            # drive_distance is relative to where the kart is NOW, while
+            # arrival is still judged from `_drive_origin` -- so what is left
+            # is the new total minus what has already been covered.
+            ox, oy = self._drive_origin
+            left = self.cell_length * self.n_cells - math.hypot(wx - ox, wy - oy)
+            link.drive_distance(left, self.drive_speed)
+        # Same stale-telemetry guard as a fresh command: the old move may
+        # have just ended, and the next frame must not judge the new one by it.
+        self._seen_active = False
+        self._active_by = time.monotonic() + self.START_GRACE_S
 
     def poll(self, link: KartLink, drive_tel: dict, wx: float, wy: float) -> str:
         """Returns "pending", "arrived" or "blocked"."""
@@ -279,7 +356,7 @@ class Leg:
     def _poll_drive(self, link, drive_tel, wx, wy) -> str:
         if not self._issued:
             self._drive_origin = (wx, wy)
-            link.drive_distance(self.cell_length, self.drive_speed)
+            link.drive_distance(self.cell_length * self.n_cells, self.drive_speed)
             self._issued = True
             self._seen_active = False
             self._active_by = time.monotonic() + self.START_GRACE_S
@@ -294,5 +371,5 @@ class Leg:
 
         ox, oy = self._drive_origin
         traveled = math.hypot(wx - ox, wy - oy)
-        self.shortfall = self.cell_length - traveled
+        self.shortfall = self.cell_length * self.n_cells - traveled
         return "blocked" if self.shortfall > self.ARRIVE_TOLERANCE_M else "arrived"

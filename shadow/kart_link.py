@@ -92,6 +92,16 @@ class KartLink:
             msg["theta"] = float(theta_deg)
         self.send_command(msg)
 
+    def halt(self):
+        """Stop whatever discrete move is running, braking to rest.
+
+        A zero `drive` twist: the server's set_twist cancels any in-flight
+        move, heading turn or goto and holds zero velocity (DriveController.
+        set_twist / stop). Sent once -- unlike set_drive() this is not
+        re-sent as a keepalive, so the next discrete command is not cancelled
+        by it."""
+        self.send_command({"type": "drive", "linear": 0.0, "angular": 0.0})
+
     # -- main-thread API: reading state --------------------------------------
     def latest(self):
         """(pose, wheel_speed) -- kept for callers that only care about those."""

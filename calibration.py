@@ -9,7 +9,7 @@ import requests as rq
 
 class Env:
     SSID         = 'F_SANTOS_2_4'
-    IPV4_ADDRESS = '192.168.0.238'
+    IPV4_ADDRESS = '192.168.0.167' #'10.77.202.59'
     PORT         = '8080'
     ROUTE        = 'command'
 
@@ -26,7 +26,7 @@ def get_kart_server_url() -> str:
 def motors_cmd_fmt(m1: int, m2: int, m3: int, m4: int) -> str:
     return f"CMD_MOTOR#{m1}#{m2}#{m3}#{m4}"
 
-def servo_cmd_fmt(channel:int,angle:float) -> str:
+def servo_cmd_fmt(channel:int,an2gle:float) -> str:
     return f"CMD_SERVO#{channel}#{angle}"
 
 def set_servos_angle(channel:int,angle:float) -> rq.Response:
@@ -291,6 +291,12 @@ if __name__ == "__main__":
     
     # dt_pulse = 0.1
     # print(schedule_turn_pulsed(2800, on_s=dt_pulse, off_s=dt_pulse, n_pulses=5, final_turn_angle=90, ccw=True))
+    
+    dt_pulse = 0.1112
+    make_turn_pwm_pulsed(3200, on_s=dt_pulse,off_s=dt_pulse, n_pulses=10)  # stepped, low-grip floors
+        
+    
+    exit(0)
     
     # MUITO PROMISSOR INCLUSIVE
     schedule_turn_trapezoid(pwm=2000, dt=0.65, 

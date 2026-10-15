@@ -47,17 +47,58 @@ COMMANDS = {
 # ---------------------------------------------------------------------------
 # Front distance sensor -> live maze
 # ---------------------------------------------------------------------------
-# A `front_distance_cm` telemetry reading at or below this marks whichever
-# cell the obstacle actually falls in as blocked in the LIVE maze (see
-# LiveMazeRunner._scan_obstacle). The maze's own walls trip this too, which is
-# harmless -- they are already walls, so the mark is a no-op.
-OBSTACLE_DISTANCE_CM = 35.0
+# A `front_distance_cm` telemetry reading at or below this is a HIT (see
+# LiveMazeRunner._scan_obstacle). A hit no longer blocks a cell on its own:
+# while the kart moves it only makes the cell a SUSPECT, and only a STEADY
+# kart, sitting in the cell right before it and facing it, gets to mark it
+# (see the OBSTACLE_* knobs below). The maze's own walls trip this too, which
+# is harmless -- they are already walls, so the mark is a no-op.
+OBSTACLE_DISTANCE_CM = 90.0
+
+# The sensor measures the NEAR face of whatever reflected, and the thing
+# occupies the space behind that face, never in front of it. So the cell an
+# obstacle is blamed on is projected this much past the hit point.
+#
+# Without it a cell-sized box (or a wall) has its face exactly on a cell
+# boundary, and the projection is a coin flip between the right cell and the
+# OPEN one before it: kart centred in a 0.30 m cell, open cell ahead, wall
+# after that -> reading 0.45 - 0.113 = 33.7 cm, rounding to 33 or 34 decides
+# whether the open cell gets marked. Sized above the 1 cm quantisation plus a
+# few cm of pose error, and well under half a cell, so a hit in the middle of
+# a cell still lands in that cell.
+OBSTACLE_HIT_DEPTH_M = 0.05
+
+# "Facing the next cell" means the heading is within this of a grid axis.
+# Same value as RANGE_FIX_ALIGN_TOLERANCE_DEG, for the same reason: further
+# off-axis the beam is as much about the neighbouring row as about the cell
+# straight ahead.
+OBSTACLE_ALIGN_TOLERANCE_DEG = 12.0
+
+# "Steady": no move in flight (`goal_active` low) and both measured wheel
+# speeds under this.
+OBSTACLE_STEADY_SPEED_MPS = 0.02
+
+# How long a steady kart must keep reading the SAME verdict about the cell
+# ahead -- blocked or clear -- before it is acted on. Any frame that moves,
+# turns off-axis or disagrees starts it over. Telemetry repeats its cached
+# reading between sensor updates, so this is time and not a frame count:
+# it has to span several real readings to filter a single stray echo.
+OBSTACLE_CONFIRM_S = 0.4
+
+# How long the runner holds in front of a suspect waiting for that verdict
+# before it gives up and drives on. Reached when the steady kart never gets
+# a usable reading of the cell (no echo, misaligned, stopped in the wrong
+# cell). The suspect is then ignored for the next leg so the kart cannot loop
+# stop -> hold -> go -> stop on it; if something really is there, the
+# server's own front guard still stops the kart, and the steady check maps it
+# from wherever it stopped.
+OBSTACLE_SUSPECT_TIMEOUT_S = 3.0
 
 # How far ahead of the kart's tracked CENTER the front sensor actually sits.
 # The reading is measured from the sensor, so this is added back before the
 # hit point is projected onto the grid; otherwise every obstacle lands about
 # half a kart-length too close and can be blamed on the wrong cell.
-SENSOR_FORWARD_OFFSET_M = 0.13
+SENSOR_FORWARD_OFFSET_M = 0.113
 
 # The other half of every front reading: whatever the beam passed THROUGH on
 # its way to the hit point has to be empty, or it would have stopped earlier.
@@ -65,7 +106,7 @@ SENSOR_FORWARD_OFFSET_M = 0.13
 # what lets a run resume by itself once an obstacle is physically taken away.
 # A cell is only cleared after this many consecutive clear looks, so one bad
 # reading (or one frame of heading jitter) cannot erase a real obstacle.
-SENSOR_CLEAR_CONFIRMATIONS = 8
+SENSOR_CLEAR_CONFIRMATIONS = 6
 
 # While waiting for a route to open up, how often to re-run the planner even
 # though nothing in the live maze changed. Maze changes retry immediately; this
@@ -252,8 +293,8 @@ RECENTER_START_GRACE_S = 0.4
 # 15 of 17 cells) but at 31 rotations per sweep instead of 11, and each rotation
 # is an open-loop turn whose own error enters the fit through the sample's
 # recorded heading.
-SWEEP_HALF_SPAN_DEG = 75.0
-SWEEP_STEP_DEG = 25.0
+SWEEP_HALF_SPAN_DEG = 90.0
+SWEEP_STEP_DEG = 45.0
 
 # Skip a side the map says is open: a sample that predicts no wall is dropped
 # by the fit anyway (scan_fit._residuals), so sweeping into open space spends
@@ -270,7 +311,7 @@ SWEEP_SETTLE_S = 0.30
 # Readings averaged at each angle. The sensor quantises to whole centimetres
 # and the fit is trying to resolve a few millimetres, so averaging a handful of
 # samples at one heading recovers resolution the single reading throws away.
-SWEEP_SAMPLES_PER_ANGLE = 3
+SWEEP_SAMPLES_PER_ANGLE = 6
 
 # Max wait for `goal_active` after a sweep rotation -- same stale-telemetry
 # guard as Leg.START_GRACE_S and RECENTER_START_GRACE_S.
@@ -331,7 +372,23 @@ SWEEP_RECENTER_MIN_ANGLE_DEG = 45.0
 # was WORSE than 3 (12.8 cm vs 4.8 cm) because of which cells the count lands
 # on -- the result aliases against the maze layout, so the knob is not
 # monotonic and tuning it is tuning noise.
-SWEEP_EVERY_N_LEGS = 3
+#
+# Counted in CELLS driven, not in Leg objects: every measurement above was
+# taken when one leg was one cell, and a leg can now span up to LEG_MAX_CELLS
+# (below). Counting legs would quietly stretch the interval up to that many
+# times further in distance.
+SWEEP_EVERY_N_LEGS = 2
+
+# Longest straight run driven as ONE leg. Consecutive path cells that keep
+# the same heading are merged into a single goto -- (r, c) -> (r, c+3) heading
+# east is one move to the far cell's centre, with no stop at the two cells in
+# between. Longer straight runs are cut into pieces of at most this many
+# cells. 1 restores the old cell-by-cell driving.
+#
+# Starts equal to SWEEP_EVERY_N_LEGS so a full straight run ends where a
+# sweep is due, but it is its own knob: tying it to the sweep interval would
+# make tuning one silently change the other.
+LEG_MAX_CELLS = 3
 
 # ---------------------------------------------------------------------------
 # The fit itself (runner/scan_fit.py)
