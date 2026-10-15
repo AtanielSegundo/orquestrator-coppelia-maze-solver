@@ -53,7 +53,7 @@ COMMANDS = {
 # kart, sitting in the cell right before it and facing it, gets to mark it
 # (see the OBSTACLE_* knobs below). The maze's own walls trip this too, which
 # is harmless -- they are already walls, so the mark is a no-op.
-OBSTACLE_DISTANCE_CM = 90.0
+OBSTACLE_DISTANCE_CM = 105.0
 
 # The sensor measures the NEAR face of whatever reflected, and the thing
 # occupies the space behind that face, never in front of it. So the cell an
@@ -98,7 +98,7 @@ OBSTACLE_SUSPECT_TIMEOUT_S = 3.0
 # The reading is measured from the sensor, so this is added back before the
 # hit point is projected onto the grid; otherwise every obstacle lands about
 # half a kart-length too close and can be blamed on the wrong cell.
-SENSOR_FORWARD_OFFSET_M = 0.113
+SENSOR_FORWARD_OFFSET_M = 0.13
 
 # The other half of every front reading: whatever the beam passed THROUGH on
 # its way to the hit point has to be empty, or it would have stopped earlier.
@@ -236,12 +236,12 @@ RECENTER_SPEED = 0.12
 # Attempts before giving up and falling back to correcting the anchor only. A
 # kart that cannot close the gap physically -- wheels against a wall, a surface
 # it cannot grip -- must not stall the whole run over 2 cm.
-RECENTER_MAX_ATTEMPTS = 3
+RECENTER_MAX_ATTEMPTS = 6
 
 # Pause after a move before re-measuring. An ultrasonic reading taken while the
 # chassis is still rocking is what would make this oscillate instead of
 # converge.
-RECENTER_SETTLE_S = 0.35
+RECENTER_SETTLE_S = 0.5
 
 # Max wait for `goal_active` to go True after issuing a move, before assuming
 # the move was too brief for telemetry to have caught the pulse. Same guard as
@@ -377,7 +377,7 @@ SWEEP_RECENTER_MIN_ANGLE_DEG = 45.0
 # taken when one leg was one cell, and a leg can now span up to LEG_MAX_CELLS
 # (below). Counting legs would quietly stretch the interval up to that many
 # times further in distance.
-SWEEP_EVERY_N_LEGS = 2
+SWEEP_EVERY_N_LEGS = 4
 
 # Longest straight run driven as ONE leg. Consecutive path cells that keep
 # the same heading are merged into a single goto -- (r, c) -> (r, c+3) heading
@@ -388,7 +388,7 @@ SWEEP_EVERY_N_LEGS = 2
 # Starts equal to SWEEP_EVERY_N_LEGS so a full straight run ends where a
 # sweep is due, but it is its own knob: tying it to the sweep interval would
 # make tuning one silently change the other.
-LEG_MAX_CELLS = 3
+LEG_MAX_CELLS = 1
 
 # ---------------------------------------------------------------------------
 # The fit itself (runner/scan_fit.py)
