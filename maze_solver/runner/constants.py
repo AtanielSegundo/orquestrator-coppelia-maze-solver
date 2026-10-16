@@ -391,6 +391,40 @@ SWEEP_EVERY_N_LEGS = 4
 LEG_MAX_CELLS = 1
 
 # ---------------------------------------------------------------------------
+# Closest obstacle as lateral reference (runner/closest_obstacle.py)
+#
+# FEATURE FLAG. True replaces the angular sweep above: at the same boundary
+# (every SWEEP_EVERY_N_LEGS cells, after Recenter) the kart turns +-90 to face
+# the closest .maze wall on the axis orthogonal to the leg, reads it, drives
+# alpha * (measured - expected) toward/away from it, re-reads, shifts the
+# anchor by what is left, and turns back. Turns alternate +90 / -90 between
+# corrections. No usable wall on either side -> nothing happens and the next
+# boundary tries again; the interval only restarts after a real reading.
+#
+# Reuses the sweep's settle/sampling knobs (SWEEP_SETTLE_S,
+# SWEEP_SAMPLES_PER_ANGLE, SWEEP_MAX_LOOKS_PER_ANGLE, SWEEP_START_GRACE_S),
+# Recenter's move speed/clamp, and SCAN_FIT_MAX_LATERAL_M as the "wrong wall"
+# ceiling on the measured error.
+#
+# The wall must be READABLE from the cell: expected range between
+# SENSOR_MIN_RANGE_CM and RANGE_FIX_MAX_TRUSTED_M. With 0.30 m cells and
+# SENSOR_FORWARD_OFFSET_M = 0.13, a wall in the ADJACENT cell is expected at
+# 0.15 - 0.13 = 2 cm, inside the blind zone, so it does not qualify; a wall
+# one open cell further (32 cm) does. Turned off, the sweep runs as before.
+# ---------------------------------------------------------------------------
+CLOSEST_OBSTACLE_AS_REFERENCE = True
+
+# Fraction of the measured error actually driven. 1.0 drives the whole of it;
+# below 1 under-corrects on purpose (useful if the move tends to overshoot).
+# The anchor correction does not depend on it -- it comes from the re-read.
+CLOSEST_OBSTACLE_ALPHA = 1.0
+
+# Only move when alpha * error is larger than this. Below it the move is
+# smaller than the sensor's whole-cm resolution can justify (and, like
+# RECENTER_MIN_STEP_M, close to what the kart can execute at all).
+CLOSEST_OBSTACLE_MINIMAL_DELTA_CM = 2.0
+
+# ---------------------------------------------------------------------------
 # The fit itself (runner/scan_fit.py)
 # ---------------------------------------------------------------------------
 # Half-width of the (dx, dy) search window. Just over half a cell: a genuine

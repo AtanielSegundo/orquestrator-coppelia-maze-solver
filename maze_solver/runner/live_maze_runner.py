@@ -21,8 +21,9 @@ from runner.constants import (
     SENSOR_FORWARD_OFFSET_M, SENSOR_FROZEN_TRAVEL_M,
     OBSTACLE_HIT_DEPTH_M, OBSTACLE_ALIGN_TOLERANCE_DEG,
     OBSTACLE_STEADY_SPEED_MPS, OBSTACLE_CONFIRM_S, OBSTACLE_SUSPECT_TIMEOUT_S,
-    SWEEP_EVERY_N_LEGS, LEG_MAX_CELLS,
+    SWEEP_EVERY_N_LEGS, LEG_MAX_CELLS, CLOSEST_OBSTACLE_AS_REFERENCE,
 )
+from runner.closest_obstacle import ClosestObstacleFix
 from runner.leg import Leg, run_heading, straight_run_end
 from runner.range_fix import RangeFix, is_trusted_reading, predict_range
 from runner.recenter import Recenter
@@ -113,6 +114,11 @@ class LiveMazeRunner:
         self._last_slip                   = {}              # kart's slip sub-dict, for the HUD
         self.recenter: Optional[Recenter] = None            # physical recentring in flight
         self.sweep: Optional[Sweep]       = None            # angular sweep in flight
+        # CLOSEST_OBSTACLE_AS_REFERENCE's replacement for the sweep, and the
+        # side it turned to last (+1 = +90, -1 = -90, 0 = none yet) so the
+        # next one turns the other way.
+        self.side_ref: Optional[ClosestObstacleFix] = None
+        self._last_side_turn = 0
         
         self._cells_since_sweep = 0     # cells, not legs -- see SWEEP_EVERY_N_LEGS
         self.sweeps_done = 0
@@ -839,9 +845,15 @@ class LiveMazeRunner:
         no rotations spent. Skipping the hopeless boundaries and sweeping every
         other one reaches the same accuracy as sweeping unconditionally while
         attempting it 13 times instead of 16 on this path.
+
+        With CLOSEST_OBSTACLE_AS_REFERENCE on, the same interval gate leads to
+        the closest-side-wall correction instead (_start_side_ref), and the
+        sweep never runs.
         """
         if self._cells_since_sweep < SWEEP_EVERY_N_LEGS:
             return False
+        if CLOSEST_OBSTACLE_AS_REFERENCE:
+            return self._start_side_ref(wx, wy, wth)
         if not self._sweep_worth_trying(wx, wy, wth):
             # Leave the counter standing: the next boundary with geometry should
             # sweep immediately rather than wait out another full interval.
@@ -927,6 +939,55 @@ class LiveMazeRunner:
         self.last_world_pose = (cx, cy, wth)
         self._update_kart_view(cx, cy, wth)
         self.sweep = None
+
+    # ---- closest obstacle as lateral reference (replaces the sweep) -------
+    def _start_side_ref(self, wx, wy, wth) -> bool:
+        """Begin a lateral correction against the closest side wall, if either
+        side has one the sensor can read (see runner/closest_obstacle.py).
+
+        No usable side: nothing to do here, and the interval counter is left
+        standing so the very next boundary tries again. The counter only
+        restarts when a correction actually took a reading (_poll_side_ref)."""
+        fix = ClosestObstacleFix(self.view, self.origin, self.cell_length,
+                                 self.link, wx, wy, wth,
+                                 last_turn=self._last_side_turn,
+                                 turn_speed=self.turn_speed)
+        if fix.refused is not None:
+            self.last_sweep_summary = fix.summary()
+            print(f"[INFO] referencia lateral: {fix.summary()} -- tento na proxima")
+            return False
+        self._last_side_turn = fix.turn
+        self.side_ref = fix
+        return True
+
+    def _poll_side_ref(self, drive_tel, wx, wy, wth):
+        """Drive the correction forward one frame. Once the kart is back on the
+        leg heading, apply the anchor shift it measured -- AFTER the physical
+        move, which odometry tracked and so did not fix the belief by itself."""
+        outcome = self.side_ref.poll(drive_tel, wx, wy, wth)
+        if outcome == "pending":
+            self.status = f"referencia lateral: {self.side_ref.status}"
+            return
+
+        fix, self.side_ref = self.side_ref, None
+        summary = fix.summary()
+        self.last_sweep_summary = summary
+        if not fix.succeeded:
+            print(f"[INFO] referencia lateral: {summary} -- tento na proxima")
+            return
+        self._cells_since_sweep = 0
+        self.sweeps_done += 1
+        print(f"[INFO] referencia lateral #{self.sweeps_done}: {summary}")
+        if fix.anchor_shift is None:
+            return
+
+        dx, dy = fix.anchor_shift
+        self.mirror.shift_anchor(dx, dy)
+        # Re-place both views now, as the sweep and the range fix do.
+        cx, cy = wx + dx, wy + dy
+        self.mirror.apply_world_pose(cx, cy, wth)
+        self.last_world_pose = (cx, cy, wth)
+        self._update_kart_view(cx, cy, wth)
 
     def _apply_range_fix(self, drive_tel, wx, wy, wth):
         """Pull the believed pose along its heading to match what the front
@@ -1025,6 +1086,9 @@ class LiveMazeRunner:
         # issuing its own turns, so no leg may start on top of them.
         if self.sweep is not None:
             self._poll_sweep(drive_tel, wx, wy, wth)
+            return
+        if self.side_ref is not None:
+            self._poll_side_ref(drive_tel, wx, wy, wth)
             return
 
         # Stopped short of a suspect: parked until the steady check settles
@@ -1154,6 +1218,8 @@ class LiveMazeRunner:
             fix_line = f"recentrando: {self.recenter.status}"
         elif self.sweep is not None:
             fix_line = f"varredura: {self.sweep.status}"
+        elif self.side_ref is not None:
+            fix_line = f"referencia lateral: {self.side_ref.status}"
         elif self.last_sweep_summary:
             # The sweep is the only thing correcting the lateral axis, and it
             # runs every few legs rather than continuously, so its last result
