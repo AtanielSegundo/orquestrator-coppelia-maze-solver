@@ -18,8 +18,11 @@ GRID_HEADING_LABEL = {
 HELP = """
 COMANDOS DO PROMPT
   ok                  confirma o kart REAL posicionado; comeca a rodar
+                      (e, parado no goal, confirma o caminho do novo goal)
   start <lin> <col>   antes do 'ok': novo start | ao vivo: novo waypoint
   goal  <lin> <col>   novo goal (antes ou durante a corrida)
+                      parado no goal: start = celula do kart, planeja e
+                      espera 'ok' (start/goal fazem o mesmo nesse caso)
   resume              esquece TODOS os obstaculos descobertos de uma vez e
                       replaneja
   status              imprime o estado atual
@@ -30,6 +33,7 @@ CONTROLS = """
 CONTROLES DA JANELA
   botao esquerdo   equivalente a 'start <lin> <col>' da celula clicada
   botao direito    equivalente a 'goal  <lin> <col>' da celula clicada
+                   (parado no goal, qualquer botao escolhe o novo goal)
   setas            move a camera pan/tilt do kart (real + sim)
   C                centraliza a camera (olhando pra frente)
   ESC              sair
@@ -83,7 +87,7 @@ OBSTACLE_STEADY_SPEED_MPS = 0.02
 # turns off-axis or disagrees starts it over. Telemetry repeats its cached
 # reading between sensor updates, so this is time and not a frame count:
 # it has to span several real readings to filter a single stray echo.
-OBSTACLE_CONFIRM_S = 0.4
+OBSTACLE_CONFIRM_S = 1.0
 
 # How long the runner holds in front of a suspect waiting for that verdict
 # before it gives up and drives on. Reached when the steady kart never gets
@@ -92,13 +96,13 @@ OBSTACLE_CONFIRM_S = 0.4
 # stop -> hold -> go -> stop on it; if something really is there, the
 # server's own front guard still stops the kart, and the steady check maps it
 # from wherever it stopped.
-OBSTACLE_SUSPECT_TIMEOUT_S = 3.0
+OBSTACLE_SUSPECT_TIMEOUT_S = 4.0
 
 # How far ahead of the kart's tracked CENTER the front sensor actually sits.
 # The reading is measured from the sensor, so this is added back before the
 # hit point is projected onto the grid; otherwise every obstacle lands about
 # half a kart-length too close and can be blamed on the wrong cell.
-SENSOR_FORWARD_OFFSET_M = 0.13
+SENSOR_FORWARD_OFFSET_M = 0.10
 
 # The other half of every front reading: whatever the beam passed THROUGH on
 # its way to the hit point has to be empty, or it would have stopped earlier.
@@ -204,7 +208,7 @@ RANGE_FIX_MIN_CORRECTION_M = 0.02
 # would teleport the kart; refusing leaves a merely-drifting pose, which is the
 # smaller error. Sized under half a cell so a whole-cell disagreement is always
 # rejected.
-RANGE_FIX_MAX_CORRECTION_M = 0.15
+RANGE_FIX_MAX_CORRECTION_M = 0.20
 
 # ---------------------------------------------------------------------------
 # Physical recentring (runner/recenter.py)
@@ -221,7 +225,7 @@ RECENTER_THRESHOLD_M = 0.02
 
 # Cap on a single corrective move. The measurement could be wrong; this bounds
 # how far a bad one can drive the kart before it is re-measured.
-RECENTER_MAX_STEP_M = 0.12
+RECENTER_MAX_STEP_M = 0.20
 
 # Floor on a single corrective move. Below this the kart cannot reliably
 # execute the command at all (stiction, the position PID's own tolerance), so
@@ -377,7 +381,7 @@ SWEEP_RECENTER_MIN_ANGLE_DEG = 45.0
 # taken when one leg was one cell, and a leg can now span up to LEG_MAX_CELLS
 # (below). Counting legs would quietly stretch the interval up to that many
 # times further in distance.
-SWEEP_EVERY_N_LEGS = 4
+SWEEP_EVERY_N_LEGS = 1
 
 # Longest straight run driven as ONE leg. Consecutive path cells that keep
 # the same heading are merged into a single goto -- (r, c) -> (r, c+3) heading
@@ -388,7 +392,7 @@ SWEEP_EVERY_N_LEGS = 4
 # Starts equal to SWEEP_EVERY_N_LEGS so a full straight run ends where a
 # sweep is due, but it is its own knob: tying it to the sweep interval would
 # make tuning one silently change the other.
-LEG_MAX_CELLS = 1
+LEG_MAX_CELLS = 2
 
 # ---------------------------------------------------------------------------
 # Closest obstacle as lateral reference (runner/closest_obstacle.py)
@@ -407,10 +411,11 @@ LEG_MAX_CELLS = 1
 # ceiling on the measured error.
 #
 # The wall must be READABLE from the cell: expected range between
-# SENSOR_MIN_RANGE_CM and RANGE_FIX_MAX_TRUSTED_M. With 0.30 m cells and
-# SENSOR_FORWARD_OFFSET_M = 0.13, a wall in the ADJACENT cell is expected at
-# 0.15 - 0.13 = 2 cm, inside the blind zone, so it does not qualify; a wall
-# one open cell further (32 cm) does. Turned off, the sweep runs as before.
+# SENSOR_MIN_RANGE_CM and RANGE_FIX_MAX_TRUSTED_M. A wall in the ADJACENT
+# cell is expected at cell/2 - SENSOR_FORWARD_OFFSET_M: 5 cm at 0.30 m cells
+# and 0.10, readable; 2 cm at 0.13, inside the blind zone, so it would not
+# qualify. A wall one open cell further (35 cm at 0.10) always does -- see
+# NEXT_BEST_CLOSEST_AS_REFERENCE. Turned off, the sweep runs as before.
 # ---------------------------------------------------------------------------
 CLOSEST_OBSTACLE_AS_REFERENCE = True
 
@@ -422,7 +427,34 @@ CLOSEST_OBSTACLE_ALPHA = 1.0
 # Only move when alpha * error is larger than this. Below it the move is
 # smaller than the sensor's whole-cm resolution can justify (and, like
 # RECENTER_MIN_STEP_M, close to what the kart can execute at all).
-CLOSEST_OBSTACLE_MINIMAL_DELTA_CM = 2.0
+CLOSEST_OBSTACLE_MINIMAL_DELTA_CM = 3.0
+
+# Visit BOTH sides (+90 and -90) on every correction instead of only the
+# preferred one -- each only if it has a readable obstacle; a side with none
+# is never turned to. The anchor shift found on the first side is folded into
+# the pose the second side is judged from, so the two refine one estimate
+# rather than double-counting it. Costs a 180 deg turn (as two 90 deg steps)
+# between the sides.
+CLOSEST_OBSTACLE_ALWAYS_CHECKS_THE_TWO = False
+
+# Postpone a due correction to a BETTER reference ahead on the path. Only
+# acts with CLOSEST_OBSTACLE_AS_REFERENCE on.
+#
+# "Better" = a readable .maze wall with exactly ONE empty cell between it and
+# the kart's cell, on the axis orthogonal to the heading the kart arrives
+# with: e.g. kart at (r, c) heading north, (r, c-1) empty, (r, c-2) wall. At
+# 0.30 m cells that reads 0.45 - SENSOR_FORWARD_OFFSET_M (35 cm at 0.10),
+# against 5 cm for an adjacent wall, right at the edge of the blind zone.
+#
+# When the correction is due and the current cell has no better reference,
+# the next MAX_NEXT_BEST_CELLS cells of the plan are checked. If one has it,
+# legs drop to ONE cell (LEG_MAX_CELLS is overridden) until that cell is
+# reached; there the correction runs facing that better wall -- even if it is
+# the same turn direction as last time -- then LEG_MAX_CELLS goes back to its
+# value and the SWEEP_EVERY_N_LEGS count restarts. Nothing better ahead: the
+# correction runs here, as without this flag. A replan drops the plan for it.
+NEXT_BEST_CLOSEST_AS_REFERENCE = True
+MAX_NEXT_BEST_CELLS = 8
 
 # ---------------------------------------------------------------------------
 # The fit itself (runner/scan_fit.py)
@@ -431,7 +463,7 @@ CLOSEST_OBSTACLE_MINIMAL_DELTA_CM = 2.0
 # error larger than this is a lost pose rather than drift, and a wider window
 # mostly lets the search find a convincing wrong answer against the next cell's
 # walls.
-SCAN_FIT_MAX_SHIFT_M = 0.12
+SCAN_FIT_MAX_SHIFT_M = 0.20
 
 # Two-pass grid: coarse over the window, then fine around the winner. The
 # product is ~250 candidate positions and a few hundred raycasts each -- tens
@@ -450,7 +482,7 @@ SCAN_FIT_FINE_STEP_M = 0.005
 #
 # The cost of the higher bar is fits refused, not fits made badly, and a
 # refused fit leaves the belief alone -- the safe direction.
-SCAN_FIT_MIN_SAMPLES = 3
+SCAN_FIT_MIN_SAMPLES = 4
 
 # Fraction of the worst residuals dropped before summing. ZERO, deliberately,
 # and this one is counter-intuitive enough to be worth the measurement.

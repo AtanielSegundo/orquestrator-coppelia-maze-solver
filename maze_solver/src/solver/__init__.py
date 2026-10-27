@@ -8,7 +8,9 @@ working.
 """
 from src.solver.constants import DIRECTIONS
 from src.solver.solve_bfs import solve_bfs
+from src.solver.solve_rl import RLSolver
 from src.solver.heading_between import heading_between
 from src.solver.resolve_maze import resolve_maze
 
-__all__ = ["DIRECTIONS", "solve_bfs", "heading_between", "resolve_maze"]
+__all__ = ["DIRECTIONS", "solve_bfs", "RLSolver", "heading_between",
+           "resolve_maze"]

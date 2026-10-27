@@ -22,8 +22,10 @@ from runner.constants import (
     OBSTACLE_HIT_DEPTH_M, OBSTACLE_ALIGN_TOLERANCE_DEG,
     OBSTACLE_STEADY_SPEED_MPS, OBSTACLE_CONFIRM_S, OBSTACLE_SUSPECT_TIMEOUT_S,
     SWEEP_EVERY_N_LEGS, LEG_MAX_CELLS, CLOSEST_OBSTACLE_AS_REFERENCE,
+    NEXT_BEST_CLOSEST_AS_REFERENCE, MAX_NEXT_BEST_CELLS,
 )
-from runner.closest_obstacle import ClosestObstacleFix
+from runner.closest_obstacle import (ClosestObstacleFix, better_side,
+                                     find_next_best, side_refs)
 from runner.leg import Leg, run_heading, straight_run_end
 from runner.range_fix import RangeFix, is_trusted_reading, predict_range
 from runner.recenter import Recenter
@@ -41,8 +43,10 @@ class LiveMazeRunner:
 
     `state` -- only meaningful once `phase == "live"`: "running" (driving a
         leg or about to start the next one), "idle" (goal reached, waiting
-        for a new one), "blocked" (a leg came up short -- obstacle or stall)
-        or "waiting" (no route to the goal through the live maze right now).
+        for a new one), "ready" (a new goal picked from idle: the route from
+        the kart's cell is planned and shown, held until 'ok'), "blocked" (a
+        leg came up short -- obstacle or stall) or "waiting" (no route to the
+        goal through the live maze right now).
 
     The last two are holding patterns, NOT dead ends: the front sensor keeps
     writing the live maze while stopped, and both states re-run the planner on
@@ -53,12 +57,22 @@ class LiveMazeRunner:
     nothing waits for it anymore.
     """
 
+    # Planner state, at class level for runners built without __init__ (the
+    # tests do that); __init__ replaces `solver` per instance.
+    # `_on_bfs_fallback`: the route on hand is BFS's because the RLSolver
+    # looped computing it -- each cell boundary then retries RL from where the
+    # kart is (once per cell + live-maze revision, `_rl_retry_key`).
+    solver = staticmethod(solve_bfs)
+    _on_bfs_fallback = False
+    _rl_retry_key = None
+
     def __init__(self, sim, kart_base, motors, maze_path: str,
                 view: MazeView, kart_view: KartView,
                 cell_length: float, ws_url: str,
                 turn_speed: float, drive_speed: float,
                 video_url: str, command_url: str, 
-                video_backend: str = "sim", wait_to_step: bool = False):
+                video_backend: str = "sim", wait_to_step: bool = False,
+                solver=solve_bfs):
         self.sim         = sim
         self.kart_base   = kart_base
         self.motors      = motors
@@ -70,7 +84,10 @@ class LiveMazeRunner:
         self.ws_url      = ws_url
         self.turn_speed  = turn_speed
         self.drive_speed = drive_speed
-        
+        # Planner behind every route: solve_bfs, or an RLSolver (--rl). Both
+        # take (view, start, goal) and return the cell list, [] if no route.
+        self.solver      = solver
+
         # Manual step gate: with `should_wait`, each leg is held at the cell
         # boundary until the operator calls release_step(). `_waiting_to_step`
         # is "parked at the gate right now" (a press is only honoured then, so
@@ -119,6 +136,13 @@ class LiveMazeRunner:
         # next one turns the other way.
         self.side_ref: Optional[ClosestObstacleFix] = None
         self._last_side_turn = 0
+        # NEXT_BEST_CLOSEST_AS_REFERENCE: a correction postponed to a cell
+        # ahead, as (plan index, cell, side), and the leg length in force --
+        # LEG_MAX_CELLS, except 1 while such a cell is still ahead.
+        self._next_best: Optional[Tuple[int, Tuple[int, int], int]] = None
+        self._leg_max_cells = LEG_MAX_CELLS
+        self._leg_max_cells_saved = LEG_MAX_CELLS
+        self._side_ref_scheduled = False
         
         self._cells_since_sweep = 0     # cells, not legs -- see SWEEP_EVERY_N_LEGS
         self.sweeps_done = 0
@@ -193,7 +217,8 @@ class LiveMazeRunner:
     def _replan_preview(self):
         """Setup-phase only: recompute where kart_base should sit and print
         the placement instructions for the operator."""
-        path = solve_bfs(self.view, self.start_cell, self.goal_cell)
+        self._on_bfs_fallback = False
+        path = self._solve(self.start_cell, self.goal_cell)
         self.plan_path = path
         if not path:
             self._preview_heading = 0.0
@@ -219,7 +244,8 @@ class LiveMazeRunner:
         print(f"[INFO] {self.status}")
 
     def confirm_ok(self):
-        if self.phase != "setup":
+        if self.phase == "live":
+            self._confirm_ready()
             return
         if not self.plan_path:
             print("[ERROR] sem caminho -- ajuste start/goal antes do 'ok'")
@@ -246,6 +272,10 @@ class LiveMazeRunner:
                              self.cell_length, cell)
 
     def set_start(self, cell) -> bool:
+        if self._parked_at_goal():
+            # The start can only be where the kart already is, so any pick
+            # made here is the next goal.
+            return self._pick_next_goal(cell)
         if self.view.is_wall(cell) or cell == self.goal_cell:
             return False
         self._move_marker("start", cell)
@@ -260,6 +290,8 @@ class LiveMazeRunner:
         return True
 
     def set_goal(self, cell) -> bool:
+        if self._parked_at_goal():
+            return self._pick_next_goal(cell)
         if self.view.is_wall(cell) or cell == self.start_cell:
             return False
         self._move_marker("goal", cell)
@@ -271,6 +303,58 @@ class LiveMazeRunner:
             self.replan_requested = True
             self.state = "running"
         return True
+
+    # ---- next goal, once the kart has reached the current one ---------------
+    def _parked_at_goal(self) -> bool:
+        return self.phase == "live" and self.state in ("idle", "ready")
+
+    def _pick_next_goal(self, cell) -> bool:
+        """The kart is parked on the goal it reached (or already holding a
+        route to a new one): the cell it is actually in becomes the start and
+        `cell` the goal, in both views. The route is planned and shown right
+        away, but nothing moves until the operator confirms it with 'ok'."""
+        start = self._nearest_cell(*self.last_world_pose[:2])
+        if self.view.is_wall(cell) or cell == start:
+            return False
+        self.start_cell = start
+        self.goal_cell  = cell
+        self.waypoint   = None
+        self.view.set_start_goal(start, cell)
+        self._move_marker("start", start)
+        self._move_marker("goal", cell)
+        self._plan_ready()
+        return True
+
+    def _plan_ready(self):
+        """Plan start_cell -> goal_cell through the live maze and hold it as
+        "ready". Re-run by step() whenever the sensor changes the live maze
+        while the kart waits, so the route on display is the one 'ok' drives."""
+        self._cancel_next_best("novo goal")
+        self._on_bfs_fallback = False
+        path = self._solve(self.start_cell, self.goal_cell)
+        self.plan_path  = path
+        self.plan_index = 0
+        self.visited    = [self.start_cell]
+        self.replan_requested  = False
+        self._planned_revision = self._live_revision
+        self.state = "ready"
+        if not path:
+            self.status = (f"[WARN] sem caminho entre {self.start_cell} e "
+                           f"{self.goal_cell} -- escolha outro goal")
+            print(self.status)
+            return
+        self.status = (f"Novo caminho {self.start_cell} -> {self.goal_cell} "
+                       f"({len(path) - 1} celula(s)). Digite 'ok' para seguir.")
+        print(f"[INFO] {self.status}")
+
+    def _confirm_ready(self):
+        if self.state != "ready":
+            return
+        if not self.plan_path:
+            print("[ERROR] sem caminho -- escolha outro goal antes do 'ok'")
+            return
+        self.state  = "running"
+        self.status = f"{self.start_cell} -> {self.goal_cell}"
 
     def resume(self):
         """Forget EVERY discovery at once and replan from wherever the kart
@@ -336,14 +420,46 @@ class LiveMazeRunner:
         c = max(0, min(self.view.cols - 1, round(cf)))
         return (r, c)
 
+    def _solve(self, start, goal):
+        """self.solver, noting when an RLSolver looped and handed back BFS's
+        route instead (solve_bfs itself has no `fell_back`)."""
+        path = self.solver(self.view, start, goal)
+        if getattr(self.solver, "fell_back", False):
+            self._on_bfs_fallback = True
+        return path
+
+    def _rl_recovered(self, current_cell) -> bool:
+        """On a BFS fallback route, whether the RL agent now reaches the goal
+        from `current_cell` without looping -- a goal-conditioned policy that
+        loops from one cell can be fine from the next. Only asks for the
+        replan; _replan_live() builds the RL route the usual way. Tried once
+        per cell and live-maze revision: the policy is deterministic, and the
+        boundary is re-entered every frame while the step gate holds."""
+        if (not self._on_bfs_fallback or self.waypoint is not None
+                or current_cell == self.goal_cell):
+            return False
+        key = (current_cell, self.goal_cell, self._live_revision)
+        if key == self._rl_retry_key:
+            return False
+        self._rl_retry_key = key
+        if not self.solver.rollout(self.view, current_cell, self.goal_cell,
+                                   verbose=False):
+            return False
+        print(f"[RL] sem loop a partir de {current_cell} -- voltando ao RL")
+        return True
+
     def _replan_live(self, current_cell):
+        # A postponed side reference names a plan index; a new plan makes it
+        # meaningless. The next boundary looks again on the new path.
+        self._cancel_next_best("replanejado")
+        self._on_bfs_fallback = False
         if self.waypoint is not None:
             via, self.waypoint = self.waypoint, None
-            leg1 = solve_bfs(self.view, current_cell, via)
-            leg2 = solve_bfs(self.view, via, self.goal_cell) if leg1 else []
+            leg1 = self._solve(current_cell, via)
+            leg2 = self._solve(via, self.goal_cell) if leg1 else []
             path = (leg1 + leg2[1:]) if (leg1 and leg2) else []
         else:
-            path = solve_bfs(self.view, current_cell, self.goal_cell)
+            path = self._solve(current_cell, self.goal_cell)
 
         self.replan_requested = False
         self._planned_revision = self._live_revision
@@ -414,6 +530,9 @@ class LiveMazeRunner:
 
         if self.state in ("blocked", "waiting"):
             self._reconsider_live(wx, wy)
+        elif self.state == "ready" and self._live_revision != self._planned_revision:
+            # The sensor changed the live maze under the route on display.
+            self._plan_ready()
         if self.state != "running":
             return
         
@@ -947,18 +1066,71 @@ class LiveMazeRunner:
 
         No usable side: nothing to do here, and the interval counter is left
         standing so the very next boundary tries again. The counter only
-        restarts when a correction actually took a reading (_poll_side_ref)."""
+        restarts when a correction actually took a reading (_poll_side_ref).
+
+        With NEXT_BEST_CLOSEST_AS_REFERENCE, a cell with no BETTER reference
+        first looks ahead on the plan for one; if found, the correction is
+        postponed to that cell (legs drop to one cell until then) and run
+        there facing it."""
+        force = None
+        scheduled = False
+        if self._next_best is not None:
+            index, cell, side = self._next_best
+            if self.plan_index < index:
+                return False          # not there yet: on, one cell at a time
+            self._end_next_best()
+            if self.plan_index == index and self.plan_path[index] == cell:
+                force, scheduled = side, True
+        elif (NEXT_BEST_CLOSEST_AS_REFERENCE
+              and better_side(side_refs(self.view, self.origin, self.cell_length,
+                                        wx, wy, wth), 0) is None
+              and self._schedule_next_best()):
+            return False
+
         fix = ClosestObstacleFix(self.view, self.origin, self.cell_length,
                                  self.link, wx, wy, wth,
                                  last_turn=self._last_side_turn,
-                                 turn_speed=self.turn_speed)
+                                 turn_speed=self.turn_speed,
+                                 force_side=force)
         if fix.refused is not None:
             self.last_sweep_summary = fix.summary()
             print(f"[INFO] referencia lateral: {fix.summary()} -- tento na proxima")
             return False
-        self._last_side_turn = fix.turn
+        self._last_side_turn = fix.last_side
         self.side_ref = fix
+        self._side_ref_scheduled = scheduled
         return True
+
+    def _schedule_next_best(self) -> bool:
+        """Look up to MAX_NEXT_BEST_CELLS ahead for a cell with a better side
+        reference; if there is one, drive there one cell at a time."""
+        found = find_next_best(self.view, self.origin, self.cell_length,
+                               self.plan_path, self.plan_index,
+                               MAX_NEXT_BEST_CELLS, self._last_side_turn)
+        if found is None:
+            return False
+        index, side = found
+        cell = self.plan_path[index]
+        self._next_best = (index, cell, side)
+        self._leg_max_cells_saved = self._leg_max_cells
+        self._leg_max_cells = 1
+        self.last_sweep_summary = (f"referencia lateral adiada para {cell} "
+                                   f"({side * 90:+d} deg, parede melhor)")
+        print(f"[INFO] {self.last_sweep_summary} -- uma celula por vez ate la")
+        return True
+
+    def _end_next_best(self):
+        """Drop the postponed reference and give LEG_MAX_CELLS back."""
+        if self._next_best is None:
+            return
+        self._next_best = None
+        self._leg_max_cells = self._leg_max_cells_saved
+
+    def _cancel_next_best(self, why):
+        if self._next_best is not None:
+            print(f"[INFO] referencia lateral adiada para {self._next_best[1]} "
+                  f"cancelada ({why})")
+            self._end_next_best()
 
     def _poll_side_ref(self, drive_tel, wx, wy, wth):
         """Drive the correction forward one frame. Once the kart is back on the
@@ -972,6 +1144,12 @@ class LiveMazeRunner:
         fix, self.side_ref = self.side_ref, None
         summary = fix.summary()
         self.last_sweep_summary = summary
+        # A postponed correction restarts the interval once it has run, read
+        # or not: the kart drove there for it, and looking ahead again right
+        # away would only keep the legs at one cell.
+        if self._side_ref_scheduled:
+            self._side_ref_scheduled = False
+            self._cells_since_sweep = 0
         if not fix.succeeded:
             print(f"[INFO] referencia lateral: {summary} -- tento na proxima")
             return
@@ -1100,7 +1278,8 @@ class LiveMazeRunner:
             return
 
         if self.leg is None:
-            if self.replan_requested:
+            if (self.replan_requested
+                    or self._rl_recovered(self._nearest_cell(wx, wy))):
                 self._replan_live(self._nearest_cell(wx, wy))
                 if self.state != "running":
                     return
@@ -1111,9 +1290,10 @@ class LiveMazeRunner:
                 return
             frm = self.plan_path[self.plan_index]
             # A straight stretch is one leg: one goto to the far centre, no
-            # stop on the cells in between (see LEG_MAX_CELLS).
+            # stop on the cells in between (see LEG_MAX_CELLS; 1 while a
+            # postponed side reference is still ahead).
             to = self.plan_path[straight_run_end(self.plan_path, self.plan_index,
-                                                 LEG_MAX_CELLS)]
+                                                 self._leg_max_cells)]
 
             # Gate AFTER recentring/sweep (they returned above) and the replan,
             # so the operator releases the leg that will really be driven, from
@@ -1133,6 +1313,8 @@ class LiveMazeRunner:
                            odom_target=odom_target)
 
             self.status = f"{frm} -> {to}"
+            if self._on_bfs_fallback:
+                self.status += "   [BFS: o RL entrou em loop]"
 
             return
 
@@ -1194,6 +1376,8 @@ class LiveMazeRunner:
             ]
         color = {"running": styles.HUDColors.text,
                 "idle": styles.HUDColors.text_ok,
+                "ready": (styles.HUDColors.text if self.plan_path
+                          else styles.HUDColors.text_fail),
                 "waiting": styles.HUDColors.text_fail,
                 "blocked": styles.HUDColors.text_fail}.get(
             self.state, styles.HUDColors.text)
@@ -1204,6 +1388,10 @@ class LiveMazeRunner:
         if self.obstacles_found:
             second += f"   |  {self.obstacles_found} obstaculo(s) no maze ao vivo"
         third = "L-click novo start   R-click novo goal"
+        if self.state == "idle":
+            third = "clique numa celula = novo goal (start = onde o kart esta)"
+        elif self.state == "ready":
+            third = "clique = outro goal   |  digite 'ok' para seguir"
         if self._waiting_to_step:
             third += "   |  ENTER = proximo passo"
         if self.state in ("blocked", "waiting"):

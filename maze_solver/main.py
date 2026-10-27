@@ -29,6 +29,7 @@ from src.renders import (
 )
 
 from src.solver import (
+    RLSolver,
     solve_bfs,
     heading_between,
     resolve_maze,
@@ -93,14 +94,18 @@ class Episode:
     """Estado do percurso. Quem chama so faz set_start / set_goal, step e
     advance; o caminho e recalculado sozinho a cada mudanca."""
 
-    def __init__(self,view:MazeView):
-        self._view = view
+    def __init__(self,view:MazeView,solver = solve_bfs):
+        self._view   = view
+        self._solver = solver      # solve_bfs ou RLSolver (--rl)
         self.start = view.start
         self.goal  = view.goal
         self.reset()
 
     def reset(self):
-        self.path    = solve_bfs(self._view, self.start, self.goal)
+        self.path    = self._solver(self._view, self.start, self.goal)
+        # O RL entrou em loop e o caminho e o do BFS: _rl_recover() tenta o
+        # RL de novo a cada celula.
+        self.on_bfs_fallback = getattr(self._solver, "fell_back", False)
         self.index   = 0
         self.frac    = 0.0     # posicao dentro do trecho atual, em [0,1)
         self.heading = 0.0
@@ -146,11 +151,24 @@ class Episode:
     def trail(self) -> List[Tuple[int,int]]:
         return self.path[:self.index + 1] if self.solvable else []
 
+    def _rl_recover(self):
+        """Na rota do BFS, volta ao RL assim que ele chegar no goal sem loop
+        a partir da celula atual. O que ja foi andado fica no caminho."""
+        if not self.on_bfs_fallback or self.finished:
+            return
+        here = self.path[self.index]
+        rl = self._solver.rollout(self._view, here, self.goal, verbose=False)
+        if rl:
+            print(f"[RL] sem loop a partir de {here} -- voltando ao RL")
+            self.path = self.path[:self.index] + rl
+            self.on_bfs_fallback = False
+
     def step(self,count:int = 1):
         for _ in range(max(1, count)):
             if self.finished:
                 break
             self.index += 1
+            self._rl_recover()
         self.frac = 0.0
 
     def advance(self,delta_time:float,step_time:float):
@@ -162,6 +180,7 @@ class Episode:
         while self.frac >= 1.0 and not self.finished:
             self.frac -= 1.0
             self.index += 1
+            self._rl_recover()
         if self.finished:
             self.frac = 0.0
 
@@ -189,13 +208,14 @@ class Episode:
 class SolverOrquestrator:
     def __init__(self,k:KartView,m:MazeView,
                  kart_lenght_in_meters = 0.28,
-                 maze_cell_lenght_in_meters = 0.3
+                 maze_cell_lenght_in_meters = 0.3,
+                 solver = solve_bfs
                  ):
         self._kart_view = k
         self._maze_view = m
         self._kart_lenght = kart_lenght_in_meters
         self._hud_view  = HUDView()
-        self._episode   = Episode(m)
+        self._episode   = Episode(m, solver)
 
         self.playing = False
         self.speed   = SIM.DEFAULT_SPEED
@@ -369,7 +389,8 @@ class SolverOrquestrator:
 
         second = (f"passos {ep.index}/{ep.optimal}"
                   f"    celula {ep.cell}"
-                  f"    vel {SIM.SPEEDS[self.speed] * 1000:.0f}ms")
+                  f"    vel {SIM.SPEEDS[self.speed] * 1000:.0f}ms"
+                  f"{'    [BFS: o RL entrou em loop]' if ep.on_bfs_fallback else ''}")
 
         third = (f"{self._maze_view.tag}  "
                  f"{self._maze_view.rows}x{self._maze_view.cols}"
@@ -439,7 +460,18 @@ class SolverOrquestrator:
 def render_solver(maze_path:str,
                   cell_lenght:float,
                   kart_lenght:float,
-                  commands:Optional[Any] = None):
+                  commands:Optional[Any] = None,
+                  rl_model:Optional[str] = None):
+    # Carregado aqui, no processo da janela: um modelo torch nao precisa
+    # atravessar o spawn.
+    solver = solve_bfs
+    if rl_model:
+        try:
+            solver = RLSolver(rl_model, maze_path)
+        except Exception as e:
+            print(f"[ERROR] nao consegui carregar o modelo RL: {e}")
+            return
+
     pr.set_config_flags(pr.ConfigFlags.FLAG_WINDOW_RESIZABLE)
     pr.set_trace_log_level(definitions.LOG.LEVEL)
 
@@ -454,7 +486,8 @@ def render_solver(maze_path:str,
 
         orquestrator = SolverOrquestrator(kart, maze_v,
                                           kart_lenght_in_meters=kart_lenght,
-                                          maze_cell_lenght_in_meters=cell_lenght)
+                                          maze_cell_lenght_in_meters=cell_lenght,
+                                          solver=solver)
         orquestrator.run(commands)
     finally:
         pr.close_window()
@@ -525,6 +558,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="maior lado do kart em metros (default: %(default)s)")
     p.add_argument("--no-cli", action="store_true",
                    help="so a janela, sem o prompt nem o processo extra")
+    p.add_argument("--rl", metavar="MODEL_PATH", default=None,
+                   help="modelo .pth (ou diretorio do treino) de "
+                        "dynamic_maze_start_goal.py para resolver no lugar "
+                        "do BFS (default: BFS)")
     return p
 
 if __name__ == "__main__":
@@ -538,7 +575,8 @@ if __name__ == "__main__":
         sys.exit(-1)
 
     if args.no_cli:
-        render_solver(maze_path, args.cell_lenght, args.kart_lenght)
+        render_solver(maze_path, args.cell_lenght, args.kart_lenght,
+                      rl_model=args.rl)
         sys.exit(0)
 
     context  = multiprocessing.get_context("spawn")
@@ -546,7 +584,7 @@ if __name__ == "__main__":
 
     p_rendering = context.Process(
         target=render_solver,
-        args=(maze_path, args.cell_lenght, args.kart_lenght, commands),
+        args=(maze_path, args.cell_lenght, args.kart_lenght, commands, args.rl),
         daemon=True,
     )
     p_rendering.start()

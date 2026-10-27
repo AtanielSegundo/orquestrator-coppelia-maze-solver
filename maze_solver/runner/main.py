@@ -19,6 +19,9 @@ Flow:
      `goal` prompt commands) while live, the run is replanned from wherever
      the kart actually is -- current cell -> new start -> new goal -- taking
      effect at the next cell boundary, never interrupting a leg in flight.
+     Once the kart has REACHED the goal, a pick (either button) is the next
+     goal instead: the kart's cell becomes the start, the route is planned and
+     shown, and nothing moves until the operator types `ok` again.
   6. Meanwhile the front distance sensor keeps writing into a LIVE copy of
      the maze, both ways: anything it sees closer than OBSTACLE_DISTANCE_CM is
      projected onto the grid and that cell is blocked, while the cells the beam
@@ -41,7 +44,7 @@ import src.styles as styles
 import src.definitions as definitions
 from src.definitions import WINDOW
 from src.renders     import KartView, MazeView
-from src.solver      import resolve_maze
+from src.solver      import RLSolver, resolve_maze, solve_bfs
 
 from runner.build_parser     import build_parser
 from runner.cli_thread       import cli_thread
@@ -59,6 +62,15 @@ def main():
     if maze_path is None:
         print(f"[ERROR] maze nao encontrado: {args.maze}")
         sys.exit(-1)
+
+    # Loaded before CoppeliaSim comes up, so a bad --rl fails fast.
+    solver = solve_bfs
+    if args.rl:
+        try:
+            solver = RLSolver(args.rl, maze_path)
+        except Exception as e:                      # noqa: BLE001
+            print(f"[ERROR] nao consegui carregar o modelo RL: {e}")
+            sys.exit(-1)
 
     _should_adopt_coppelia_process = not args.coppelia_detach   
     coppelia_process = evoke_coppelia(_should_adopt_coppelia_process)
@@ -95,7 +107,8 @@ def main():
                             args.cell_lenght, ws_url,
                             args.turn_speed, args.drive_speed,
                             video_url, command_url, args.video,
-                            wait_to_step=args.wait_to_step
+                            wait_to_step=args.wait_to_step,
+                            solver=solver
                             )
 
     commands: "queue.Queue" = queue.Queue()
