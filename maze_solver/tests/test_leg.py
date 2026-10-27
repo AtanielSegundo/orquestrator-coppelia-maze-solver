@@ -29,7 +29,8 @@ sys.path.insert(0, REPO)
 sys.path.insert(0, MAZE_SOLVER)
 
 import Coppelia.helpers as cop                                    # noqa: E402
-from runner.leg import Leg                                        # noqa: E402
+from runner.leg import (Leg, run_heading,                         # noqa: E402
+                        straight_run_end)
 from shadow import grid_heading_to_world_theta                    # noqa: E402
 
 CELL = 0.25
@@ -117,9 +118,8 @@ def center(cell):
 def absolute_kw(to_cell, from_cell):
     """The target pair the runner builds (see LiveMazeRunner._leg_target),
     with the identity anchor this fake kart uses."""
-    from src.solver import heading_between
     tx, ty = center(to_cell)
-    wth = grid_heading_to_world_theta(heading_between(from_cell, to_cell))
+    wth = grid_heading_to_world_theta(run_heading(from_cell, to_cell))
     return {"target_world": (tx, ty),
             "odom_target": (tx, ty, math.degrees(wth))}
 
@@ -353,6 +353,140 @@ class TestRelativeLegCarriesError(unittest.TestCase):
         turns = [c[1] for c in kart.commands if c[0] == "turn"]
         self.assertEqual(len(turns), 3)
         self.assertAlmostEqual(sum(turns), 90.0, places=6)
+
+
+class TestStraightRuns(unittest.TestCase):
+    """Consecutive cells with one heading are driven as ONE leg."""
+
+    EAST5 = [(1, 0), (1, 1), (1, 2), (1, 3), (1, 4), (1, 5)]
+
+    def test_run_is_capped_at_max_cells(self):
+        self.assertEqual(straight_run_end(self.EAST5, 0, 3), 3)
+        # The rest of the corridor is the next leg.
+        self.assertEqual(straight_run_end(self.EAST5, 3, 3), 5)
+
+    def test_run_ends_where_the_heading_changes(self):
+        path = [(1, 0), (1, 1), (1, 2), (0, 2), (0, 3)]
+        self.assertEqual(straight_run_end(path, 0, 3), 2)
+        self.assertEqual(straight_run_end(path, 2, 3), 3)   # the turn north
+
+    def test_cap_of_one_is_cell_by_cell(self):
+        for i in range(len(self.EAST5) - 1):
+            self.assertEqual(straight_run_end(self.EAST5, i, 1), i + 1)
+
+    def test_multi_cell_leg_is_one_goto_to_the_far_center(self):
+        frm, to = (1, 1), (1, 4)
+        cx, cy = center(frm)
+        kart = FakeKart(cx + 0.02, cy - 0.01, grid_heading_to_world_theta(0))
+
+        outcome, leg = run_leg(kart, frm, to, **absolute_kw(to, frm))
+        self.assertEqual(outcome, "arrived")
+        self.assertEqual(leg.n_cells, 3)
+        self.assertEqual([c[0] for c in kart.commands], ["goto"])
+        tx, ty = center(to)
+        self.assertAlmostEqual(kart.x, tx, places=9)
+        self.assertAlmostEqual(kart.y, ty, places=9)
+
+    def test_multi_cell_relative_leg_drives_the_whole_run(self):
+        frm, to = (3, 1), (0, 1)                 # three cells north
+        cx, cy = center(frm)
+        kart = FakeKart(cx, cy, grid_heading_to_world_theta(90))
+
+        outcome, _ = run_leg(kart, frm, to, relative=True)
+        self.assertEqual(outcome, "arrived")
+        self.assertEqual(kart.commands, [("drive_distance", 3 * CELL, 0.2)])
+
+    def test_a_bend_is_not_a_leg(self):
+        with self.assertRaises(ValueError):
+            Leg((1, 1), (2, 2), 0.0, CELL)
+
+
+class LazyKart(FakeKart):
+    """A FakeKart whose moves only land when they FINISH, and a newer command
+    replaces one in flight -- which is what the server does with a re-issued
+    goto or drive_distance, and what retarget relies on."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._pending = None
+
+    def goto(self, x, y, theta_deg=None):
+        self.commands.append(("goto", x, y, theta_deg))
+        self._pending = ("goto", x, y, theta_deg)
+        self._active = self.active_polls
+
+    def drive_distance(self, distance_m, speed=0.2):
+        self.commands.append(("drive_distance", distance_m, speed))
+        self._pending = ("drive_distance", distance_m)
+        self._active = self.active_polls
+
+    def telemetry(self):
+        tel = super().telemetry()
+        if not tel["goal_active"] and self._pending is not None:
+            move, self._pending = self._pending, None
+            if move[0] == "goto":
+                self.x, self.y = move[1], move[2]
+            else:
+                self.x += math.cos(self.theta) * move[1]
+                self.y += math.sin(self.theta) * move[1]
+        return tel
+
+
+class TestRetarget(unittest.TestCase):
+    """Cutting a run short in flight -- how the runner stops the kart in the
+    cell before a suspected obstacle."""
+
+    def test_in_flight_goto_is_reissued_to_the_nearer_center(self):
+        frm, far, near = (1, 0), (1, 3), (1, 1)
+        cx, cy = center(frm)
+        kart = LazyKart(cx, cy, grid_heading_to_world_theta(0), active_polls=3)
+        leg = Leg(frm, far, kart.theta, CELL, **absolute_kw(far, frm))
+
+        leg.poll(kart, kart.telemetry(), kart.x, kart.y)       # goto -> far
+        leg.retarget(kart, near, kart.x, kart.y, **absolute_kw(near, frm))
+        outcome = "pending"
+        while outcome == "pending":
+            outcome = leg.poll(kart, kart.telemetry(), kart.x, kart.y)
+
+        self.assertEqual(outcome, "arrived")
+        self.assertEqual((leg.to_cell, leg.n_cells), (near, 1))
+        gotos = [c for c in kart.commands if c[0] == "goto"]
+        self.assertEqual(len(gotos), 2)
+        tx, ty = center(near)
+        self.assertAlmostEqual(kart.x, tx, places=9)
+        self.assertAlmostEqual(kart.y, ty, places=9)
+
+    def test_before_the_goto_is_issued_nothing_is_sent_early(self):
+        """Still pre-turning: the goto that follows simply aims at the new end."""
+        frm, far, near = (1, 1), (4, 1), (2, 1)             # south, from heading 90
+        cx, cy = center(frm)
+        kart = FakeKart(cx, cy, grid_heading_to_world_theta(90))
+        leg = Leg(frm, far, kart.theta, CELL, turn_max_angle_step=45.0,
+                  **absolute_kw(far, frm))
+        leg.poll(kart, kart.telemetry(), kart.x, kart.y)       # first turn chunk
+        leg.retarget(kart, near, kart.x, kart.y, **absolute_kw(near, frm))
+        outcome = "pending"
+        while outcome == "pending":
+            outcome = leg.poll(kart, kart.telemetry(), kart.x, kart.y)
+
+        self.assertEqual(outcome, "arrived")
+        gotos = [c for c in kart.commands if c[0] == "goto"]
+        self.assertEqual(len(gotos), 1)
+        tx, ty = center(near)
+        self.assertAlmostEqual(gotos[0][1], tx, places=9)
+        self.assertAlmostEqual(gotos[0][2], ty, places=9)
+
+    def test_relative_leg_drives_only_what_is_left(self):
+        frm, far, near = (1, 0), (1, 3), (1, 2)
+        cx, cy = center(frm)
+        kart = LazyKart(cx, cy, grid_heading_to_world_theta(0), active_polls=3)
+        leg = Leg(frm, far, kart.theta, CELL, relative=True)
+
+        leg.poll(kart, kart.telemetry(), kart.x, kart.y)       # drive 3 cells
+        # Pretend the kart is already 0.1 m along when the suspect shows up.
+        leg.retarget(kart, near, cx + 0.1, cy)
+        self.assertAlmostEqual(kart.commands[-1][1], 2 * CELL - 0.1, places=9)
+        self.assertEqual(leg.n_cells, 2)
 
 
 if __name__ == "__main__":

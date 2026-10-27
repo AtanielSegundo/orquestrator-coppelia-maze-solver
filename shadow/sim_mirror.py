@@ -103,6 +103,12 @@ class SimMirror:
         """Motion since the first odometry sample, in that sample's frame."""
         return compose(inverse(odom_ref), odom_pose)
 
+    def world_pose_of(self, rel):
+        """The belief for relative motion `rel` (see `relative`) under the
+        CURRENT anchor -- e.g. the capture pose as it stands after a
+        correction already moved the anchor."""
+        return compose(self.initial, rel)
+
     def world_pose(self, odom_pose, odom_ref):
         """Odom telemetry pose -> world (x, y, theta) of the kart's CENTER,
         relative to the first odom sample (odom_ref) and anchored to the

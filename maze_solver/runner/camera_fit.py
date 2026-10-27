@@ -29,7 +29,7 @@ each nuisance's.
 Search: a grid to find the basin, Levenberg-Marquardt to finish it
 -----------------------------------------------------------------
 The cost has real local minima -- the next cell's walls look like this cell's --
-so it starts with an exhaustive coarse grid (11x11 translations x 13 yaws, each
+so it starts with an exhaustive coarse grid (11x11 translations x 17 yaws, each
 nuisance minimised out). Scored at a WIDENED sigma (CAMERA_FIX_COARSE_SIGMA_
 SCALE): near a side wall a contact moves ~4 px per cm, so at the real sigma a
 2 cm grid step would put every candidate but the exact one on the truncated
@@ -83,7 +83,8 @@ from runner.constants import (
     CAMERA_FIX_PAN_NUISANCE_HALF_DEG, CAMERA_FIX_PAN_NUISANCE_SIGMA_DEG,
     CAMERA_FIX_PIXEL_SIGMA_PX, CAMERA_FIX_SEARCH_HALF_M,
     CAMERA_FIX_SEARCH_HALF_YAW_DEG, CAMERA_FIX_TRANSLATION_PRIOR_M,
-    CAMERA_FIX_TRUNCATE_K, CAMERA_FIX_YAW_PRIOR_DEG, SCAN_FIT_YIELD_S,
+    CAMERA_FIX_TRUNCATE_K, CAMERA_FIX_VIEW_BIAS_PX, CAMERA_FIX_YAW_PRIOR_DEG,
+    SCAN_FIT_YIELD_S,
 )
 from runner.contact_model import near_walls, predict_intervals
 from runner.view_geometry import ViewGeometry
@@ -128,6 +129,7 @@ class FitParams:
     min_improvement: float = CAMERA_FIX_MIN_IMPROVEMENT
     confirm_m: float = CAMERA_FIX_CONFIRM_M
     confirm_yaw_deg: float = CAMERA_FIX_CONFIRM_YAW_DEG
+    view_bias_px: float = CAMERA_FIX_VIEW_BIAS_PX
     yield_s: float = SCAN_FIT_YIELD_S
 
 
@@ -223,6 +225,7 @@ class _Solution(NamedTuple):
     cost_data: float
     residuals: np.ndarray            # final data residuals, sigma units
     H_data: np.ndarray               # Gauss-Newton information, data + eta priors
+    bias_cov: np.ndarray             # covariance from per-view systematic row bias
 
 
 class CameraFitter:
@@ -542,12 +545,45 @@ class CameraFitter:
         _rp, Jp_eta = self._priors(x, with_kart=False)
         H_data = (J.T * w) @ J / p.corr + Jp_eta.T @ Jp_eta
         cost_map, cost_data = total(res, x, p.sigma_px)
-        return _Solution(x, cost_map, cost_data, r / p.sigma_px, H_data)
+        return _Solution(x, cost_map, cost_data, r / p.sigma_px, H_data,
+                         self._bias_cov(J, w, H_data, [len(res[v]) for v in views]))
+
+    def _bias_cov(self, J, w, H, lengths) -> np.ndarray:
+        """Covariance of the estimate due to a SYSTEMATIC row error per view.
+
+        Column errors inside one view are not all independent noise: the
+        segmentation can put a whole view's boundary a pixel high or low
+        (colour-model asymmetry, JPEG's half-resolution chroma), and a tilt
+        that lands a fraction of a degree off shifts every row together. The
+        statistical covariance (s2 H^-1) treats columns as independent and so
+        does not see it -- measured in the closed loop, a fit with two views
+        reported 1.2 mm lateral std while sitting 1.6 cm off, slid along the
+        lateral-yaw valley by a 1 px bias in one view.
+
+        A bias of beta px on every row of view v moves the Gauss-Newton optimum
+        by s_v = H^-1 (1/c) J^T W 1_v (beta / sigma). With independent biases
+        per view, they add sum_v s_v s_v^T to the covariance -- large exactly
+        where one view's offset can be traded for lateral or yaw.
+        """
+        n = H.shape[0]
+        out = np.zeros((n, n))
+        if self.p.view_bias_px <= 0:
+            return out
+        Hinv = np.linalg.pinv(H)
+        start = 0
+        for m in lengths:
+            ones = np.zeros(J.shape[0])
+            ones[start:start + m] = 1.0
+            start += m
+            g = (J.T * w) @ ones / self.p.corr * (self.p.view_bias_px / self.p.sigma_px)
+            sv = Hinv @ g
+            out += np.outer(sv, sv)
+        return out
 
     def _marginal_std(self, sol: _Solution, s2: float) -> Tuple[float, float, float]:
         lam, V = np.linalg.eigh(sol.H_data)
         lam = np.maximum(lam, s2 / 1.0)       # floor = 1 m / 1 rad of std
-        cov = (V * (s2 / lam)) @ V.T
+        cov = (V * (s2 / lam)) @ V.T + sol.bias_cov
         return tuple(float(math.sqrt(max(cov[i, i], 0.0))) for i in range(3))
 
     def _cost_at(self, x: np.ndarray) -> float:
@@ -634,9 +670,14 @@ class CameraFitter:
         lat = b if lat_obs else None
         lng = a if long_obs else None
         yaw = psi if yaw_obs else None
-        small = ((lat is None or abs(lat) < p.confirm_m)
-                 and (lng is None or abs(lng) < p.confirm_m)
-                 and (yaw is None or abs(yaw) < math.radians(p.confirm_yaw_deg)))
+        # Confirmed = nothing worth applying: every reported component under
+        # its dead-band, or under twice its own std when that is wider (not
+        # distinguishable from zero).
+        def negligible(v, sd, floor):
+            return v is None or abs(v) < max(floor, 2.0 * sd)
+        small = (negligible(lat, std[1], p.confirm_m)
+                 and negligible(lng, std[0], p.confirm_m)
+                 and negligible(yaw, std[2], math.radians(p.confirm_yaw_deg)))
         reason = ", ".join(reasons)
         if small:
             return CameraFit(CONFIRMED, reason, lng, lat, yaw, **base)

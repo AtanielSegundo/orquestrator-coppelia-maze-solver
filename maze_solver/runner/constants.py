@@ -18,8 +18,11 @@ GRID_HEADING_LABEL = {
 HELP = """
 COMANDOS DO PROMPT
   ok                  confirma o kart REAL posicionado; comeca a rodar
+                      (e, parado no goal, confirma o caminho do novo goal)
   start <lin> <col>   antes do 'ok': novo start | ao vivo: novo waypoint
   goal  <lin> <col>   novo goal (antes ou durante a corrida)
+                      parado no goal: start = celula do kart, planeja e
+                      espera 'ok' (start/goal fazem o mesmo nesse caso)
   resume              esquece TODOS os obstaculos descobertos de uma vez e
                       replaneja
   camfix              mede a pose com a camera ali mesmo, sem aplicar nada
@@ -32,6 +35,7 @@ CONTROLS = """
 CONTROLES DA JANELA
   botao esquerdo   equivalente a 'start <lin> <col>' da celula clicada
   botao direito    equivalente a 'goal  <lin> <col>' da celula clicada
+                   (parado no goal, qualquer botao escolhe o novo goal)
   setas            move a camera pan/tilt do kart (real + sim)
   C                centraliza a camera (olhando pra frente)
   ESC              sair
@@ -50,17 +54,58 @@ COMMANDS = {
 # ---------------------------------------------------------------------------
 # Front distance sensor -> live maze
 # ---------------------------------------------------------------------------
-# A `front_distance_cm` telemetry reading at or below this marks whichever
-# cell the obstacle actually falls in as blocked in the LIVE maze (see
-# LiveMazeRunner._scan_obstacle). The maze's own walls trip this too, which is
-# harmless -- they are already walls, so the mark is a no-op.
-OBSTACLE_DISTANCE_CM = 35.0
+# A `front_distance_cm` telemetry reading at or below this is a HIT (see
+# LiveMazeRunner._scan_obstacle). A hit no longer blocks a cell on its own:
+# while the kart moves it only makes the cell a SUSPECT, and only a STEADY
+# kart, sitting in the cell right before it and facing it, gets to mark it
+# (see the OBSTACLE_* knobs below). The maze's own walls trip this too, which
+# is harmless -- they are already walls, so the mark is a no-op.
+OBSTACLE_DISTANCE_CM = 105.0
+
+# The sensor measures the NEAR face of whatever reflected, and the thing
+# occupies the space behind that face, never in front of it. So the cell an
+# obstacle is blamed on is projected this much past the hit point.
+#
+# Without it a cell-sized box (or a wall) has its face exactly on a cell
+# boundary, and the projection is a coin flip between the right cell and the
+# OPEN one before it: kart centred in a 0.30 m cell, open cell ahead, wall
+# after that -> reading 0.45 - 0.113 = 33.7 cm, rounding to 33 or 34 decides
+# whether the open cell gets marked. Sized above the 1 cm quantisation plus a
+# few cm of pose error, and well under half a cell, so a hit in the middle of
+# a cell still lands in that cell.
+OBSTACLE_HIT_DEPTH_M = 0.05
+
+# "Facing the next cell" means the heading is within this of a grid axis.
+# Same value as RANGE_FIX_ALIGN_TOLERANCE_DEG, for the same reason: further
+# off-axis the beam is as much about the neighbouring row as about the cell
+# straight ahead.
+OBSTACLE_ALIGN_TOLERANCE_DEG = 12.0
+
+# "Steady": no move in flight (`goal_active` low) and both measured wheel
+# speeds under this.
+OBSTACLE_STEADY_SPEED_MPS = 0.02
+
+# How long a steady kart must keep reading the SAME verdict about the cell
+# ahead -- blocked or clear -- before it is acted on. Any frame that moves,
+# turns off-axis or disagrees starts it over. Telemetry repeats its cached
+# reading between sensor updates, so this is time and not a frame count:
+# it has to span several real readings to filter a single stray echo.
+OBSTACLE_CONFIRM_S = 1.0
+
+# How long the runner holds in front of a suspect waiting for that verdict
+# before it gives up and drives on. Reached when the steady kart never gets
+# a usable reading of the cell (no echo, misaligned, stopped in the wrong
+# cell). The suspect is then ignored for the next leg so the kart cannot loop
+# stop -> hold -> go -> stop on it; if something really is there, the
+# server's own front guard still stops the kart, and the steady check maps it
+# from wherever it stopped.
+OBSTACLE_SUSPECT_TIMEOUT_S = 4.0
 
 # How far ahead of the kart's tracked CENTER the front sensor actually sits.
 # The reading is measured from the sensor, so this is added back before the
 # hit point is projected onto the grid; otherwise every obstacle lands about
 # half a kart-length too close and can be blamed on the wrong cell.
-SENSOR_FORWARD_OFFSET_M = 0.113
+SENSOR_FORWARD_OFFSET_M = 0.10
 
 # The other half of every front reading: whatever the beam passed THROUGH on
 # its way to the hit point has to be empty, or it would have stopped earlier.
@@ -68,7 +113,7 @@ SENSOR_FORWARD_OFFSET_M = 0.113
 # what lets a run resume by itself once an obstacle is physically taken away.
 # A cell is only cleared after this many consecutive clear looks, so one bad
 # reading (or one frame of heading jitter) cannot erase a real obstacle.
-SENSOR_CLEAR_CONFIRMATIONS = 8
+SENSOR_CLEAR_CONFIRMATIONS = 6
 
 # While waiting for a route to open up, how often to re-run the planner even
 # though nothing in the live maze changed. Maze changes retry immediately; this
@@ -166,7 +211,7 @@ RANGE_FIX_MIN_CORRECTION_M = 0.02
 # would teleport the kart; refusing leaves a merely-drifting pose, which is the
 # smaller error. Sized under half a cell so a whole-cell disagreement is always
 # rejected.
-RANGE_FIX_MAX_CORRECTION_M = 0.15
+RANGE_FIX_MAX_CORRECTION_M = 0.20
 
 # ---------------------------------------------------------------------------
 # Physical recentring (runner/recenter.py)
@@ -183,7 +228,7 @@ RECENTER_THRESHOLD_M = 0.02
 
 # Cap on a single corrective move. The measurement could be wrong; this bounds
 # how far a bad one can drive the kart before it is re-measured.
-RECENTER_MAX_STEP_M = 0.12
+RECENTER_MAX_STEP_M = 0.20
 
 # Floor on a single corrective move. Below this the kart cannot reliably
 # execute the command at all (stiction, the position PID's own tolerance), so
@@ -198,12 +243,12 @@ RECENTER_SPEED = 0.12
 # Attempts before giving up and falling back to correcting the anchor only. A
 # kart that cannot close the gap physically -- wheels against a wall, a surface
 # it cannot grip -- must not stall the whole run over 2 cm.
-RECENTER_MAX_ATTEMPTS = 3
+RECENTER_MAX_ATTEMPTS = 6
 
 # Pause after a move before re-measuring. An ultrasonic reading taken while the
 # chassis is still rocking is what would make this oscillate instead of
 # converge.
-RECENTER_SETTLE_S = 0.35
+RECENTER_SETTLE_S = 0.5
 
 # Max wait for `goal_active` to go True after issuing a move, before assuming
 # the move was too brief for telemetry to have caught the pulse. Same guard as
@@ -255,8 +300,8 @@ RECENTER_START_GRACE_S = 0.4
 # 15 of 17 cells) but at 31 rotations per sweep instead of 11, and each rotation
 # is an open-loop turn whose own error enters the fit through the sample's
 # recorded heading.
-SWEEP_HALF_SPAN_DEG = 75.0
-SWEEP_STEP_DEG = 25.0
+SWEEP_HALF_SPAN_DEG = 90.0
+SWEEP_STEP_DEG = 45.0
 
 # Skip a side the map says is open: a sample that predicts no wall is dropped
 # by the fit anyway (scan_fit._residuals), so sweeping into open space spends
@@ -273,7 +318,7 @@ SWEEP_SETTLE_S = 0.30
 # Readings averaged at each angle. The sensor quantises to whole centimetres
 # and the fit is trying to resolve a few millimetres, so averaging a handful of
 # samples at one heading recovers resolution the single reading throws away.
-SWEEP_SAMPLES_PER_ANGLE = 3
+SWEEP_SAMPLES_PER_ANGLE = 6
 
 # Max wait for `goal_active` after a sweep rotation -- same stale-telemetry
 # guard as Leg.START_GRACE_S and RECENTER_START_GRACE_S.
@@ -334,7 +379,85 @@ SWEEP_RECENTER_MIN_ANGLE_DEG = 45.0
 # was WORSE than 3 (12.8 cm vs 4.8 cm) because of which cells the count lands
 # on -- the result aliases against the maze layout, so the knob is not
 # monotonic and tuning it is tuning noise.
-SWEEP_EVERY_N_LEGS = 3
+#
+# Counted in CELLS driven, not in Leg objects: every measurement above was
+# taken when one leg was one cell, and a leg can now span up to LEG_MAX_CELLS
+# (below). Counting legs would quietly stretch the interval up to that many
+# times further in distance.
+SWEEP_EVERY_N_LEGS = 1
+
+# Longest straight run driven as ONE leg. Consecutive path cells that keep
+# the same heading are merged into a single goto -- (r, c) -> (r, c+3) heading
+# east is one move to the far cell's centre, with no stop at the two cells in
+# between. Longer straight runs are cut into pieces of at most this many
+# cells. 1 restores the old cell-by-cell driving.
+#
+# Starts equal to SWEEP_EVERY_N_LEGS so a full straight run ends where a
+# sweep is due, but it is its own knob: tying it to the sweep interval would
+# make tuning one silently change the other.
+LEG_MAX_CELLS = 2
+
+# ---------------------------------------------------------------------------
+# Closest obstacle as lateral reference (runner/closest_obstacle.py)
+#
+# FEATURE FLAG. True replaces the angular sweep above: at the same boundary
+# (every SWEEP_EVERY_N_LEGS cells, after Recenter) the kart turns +-90 to face
+# the closest .maze wall on the axis orthogonal to the leg, reads it, drives
+# alpha * (measured - expected) toward/away from it, re-reads, shifts the
+# anchor by what is left, and turns back. Turns alternate +90 / -90 between
+# corrections. No usable wall on either side -> nothing happens and the next
+# boundary tries again; the interval only restarts after a real reading.
+#
+# Reuses the sweep's settle/sampling knobs (SWEEP_SETTLE_S,
+# SWEEP_SAMPLES_PER_ANGLE, SWEEP_MAX_LOOKS_PER_ANGLE, SWEEP_START_GRACE_S),
+# Recenter's move speed/clamp, and SCAN_FIT_MAX_LATERAL_M as the "wrong wall"
+# ceiling on the measured error.
+#
+# The wall must be READABLE from the cell: expected range between
+# SENSOR_MIN_RANGE_CM and RANGE_FIX_MAX_TRUSTED_M. A wall in the ADJACENT
+# cell is expected at cell/2 - SENSOR_FORWARD_OFFSET_M: 5 cm at 0.30 m cells
+# and 0.10, readable; 2 cm at 0.13, inside the blind zone, so it would not
+# qualify. A wall one open cell further (35 cm at 0.10) always does -- see
+# NEXT_BEST_CLOSEST_AS_REFERENCE. Turned off, the sweep runs as before.
+# ---------------------------------------------------------------------------
+CLOSEST_OBSTACLE_AS_REFERENCE = True
+
+# Fraction of the measured error actually driven. 1.0 drives the whole of it;
+# below 1 under-corrects on purpose (useful if the move tends to overshoot).
+# The anchor correction does not depend on it -- it comes from the re-read.
+CLOSEST_OBSTACLE_ALPHA = 1.0
+
+# Only move when alpha * error is larger than this. Below it the move is
+# smaller than the sensor's whole-cm resolution can justify (and, like
+# RECENTER_MIN_STEP_M, close to what the kart can execute at all).
+CLOSEST_OBSTACLE_MINIMAL_DELTA_CM = 3.0
+
+# Visit BOTH sides (+90 and -90) on every correction instead of only the
+# preferred one -- each only if it has a readable obstacle; a side with none
+# is never turned to. The anchor shift found on the first side is folded into
+# the pose the second side is judged from, so the two refine one estimate
+# rather than double-counting it. Costs a 180 deg turn (as two 90 deg steps)
+# between the sides.
+CLOSEST_OBSTACLE_ALWAYS_CHECKS_THE_TWO = False
+
+# Postpone a due correction to a BETTER reference ahead on the path. Only
+# acts with CLOSEST_OBSTACLE_AS_REFERENCE on.
+#
+# "Better" = a readable .maze wall with exactly ONE empty cell between it and
+# the kart's cell, on the axis orthogonal to the heading the kart arrives
+# with: e.g. kart at (r, c) heading north, (r, c-1) empty, (r, c-2) wall. At
+# 0.30 m cells that reads 0.45 - SENSOR_FORWARD_OFFSET_M (35 cm at 0.10),
+# against 5 cm for an adjacent wall, right at the edge of the blind zone.
+#
+# When the correction is due and the current cell has no better reference,
+# the next MAX_NEXT_BEST_CELLS cells of the plan are checked. If one has it,
+# legs drop to ONE cell (LEG_MAX_CELLS is overridden) until that cell is
+# reached; there the correction runs facing that better wall -- even if it is
+# the same turn direction as last time -- then LEG_MAX_CELLS goes back to its
+# value and the SWEEP_EVERY_N_LEGS count restarts. Nothing better ahead: the
+# correction runs here, as without this flag. A replan drops the plan for it.
+NEXT_BEST_CLOSEST_AS_REFERENCE = True
+MAX_NEXT_BEST_CELLS = 8
 
 # ---------------------------------------------------------------------------
 # The fit itself (runner/scan_fit.py)
@@ -343,7 +466,7 @@ SWEEP_EVERY_N_LEGS = 3
 # error larger than this is a lost pose rather than drift, and a wider window
 # mostly lets the search find a convincing wrong answer against the next cell's
 # walls.
-SCAN_FIT_MAX_SHIFT_M = 0.12
+SCAN_FIT_MAX_SHIFT_M = 0.20
 
 # Two-pass grid: coarse over the window, then fine around the winner. The
 # product is ~250 candidate positions and a few hundred raycasts each -- tens
@@ -362,7 +485,7 @@ SCAN_FIT_FINE_STEP_M = 0.005
 #
 # The cost of the higher bar is fits refused, not fits made badly, and a
 # refused fit leaves the belief alone -- the safe direction.
-SCAN_FIT_MIN_SAMPLES = 3
+SCAN_FIT_MIN_SAMPLES = 4
 
 # Fraction of the worst residuals dropped before summing. ZERO, deliberately,
 # and this one is counter-intuitive enough to be worth the measurement.
@@ -469,15 +592,23 @@ SCAN_FIT_YIELD_S = 0.0005
 # ---------------------------------------------------------------------------
 # Camera pose fix (runner/camera_fix.py, runner/camera_fit.py)
 #
-# The sweep above recovers the LATERAL axis by rotating the whole kart through
-# ~10 headings and reading an ultrasonic whose cone smears the very profile it
-# fits. The camera sees the same geometry in one look: where each wall stands
-# on the floor (the floor-contact profile, camera_link/contact_profile.py) moves
-# in the image when the kart moves sideways, and the pan servo turns the CAMERA
-# instead of the kart to look at the side walls. So at each cell the camera
-# fit runs first, corrects lateral + yaw in the belief, optionally drives the
-# kart back to the centre, and the sweep only runs when the camera could not
-# produce a lateral at that cell.
+# The camera sees where each wall stands on the floor (the floor-contact
+# profile, camera_link/contact_profile.py); that moves in the image when the
+# kart moves sideways or turns, and the pan servo turns the CAMERA instead of
+# the kart to look at the side walls. It resolves millimetres where the sonar
+# resolves centimetres.
+#
+# It works WITH the sonar correctors, not instead of them. At every boundary:
+#
+#     Recenter -> [closest obstacle reference | sweep, when due] -> camera
+#
+# The sonar correctors keep their own schedule and make the BIG corrections
+# (centimetres, physical moves); on the real tcc.maze, CLOSEST_OBSTACLE_AS_
+# REFERENCE alone holds for about three full 12-15 cell runs before the error
+# it leaves behind starts to matter. The camera runs last and makes only the
+# SMALL ones (CAMERA_FIX_SMALL_*): what the sonar leaves below its own
+# thresholds and quantisation, plus the heading error of every turn made at
+# the boundary -- the error that makes those runs drift in the first place.
 # ---------------------------------------------------------------------------
 CAMERA_FIX_ENABLED = True
 
@@ -601,11 +732,18 @@ CAMERA_FIX_MIN_RUN_PX = 3
 CAMERA_FIX_BEARING_STEP_DEG = 0.15
 
 # Wall/floor colour model (camera_link/floor_segmenter.py). The margin is how
-# far from a PREDICTED boundary a pixel must be to train on: larger than the
-# image shift of a few cm of pose error near the kart.
+# far from a PREDICTED boundary a pixel must be to train on, larger than what
+# the pose error moves a boundary: ~4 px per cm near the kart, and f*tan(yaw)
+# sideways for a heading error -- 21 px at 3 deg, which is what a turn leaves
+# (the 12 px it was sized at for translation alone let vertical wall edges
+# into the wrong class in the closed loop).
 CAMERA_SEG_COMPONENTS = 2
 CAMERA_SEG_L_WEIGHT = 1.0 / 3.0
-CAMERA_SEG_LABEL_MARGIN_PX = 12
+CAMERA_SEG_LABEL_MARGIN_PX = 24
+# Self-training rounds after the seed (floor_segmenter.FloorSegmenter.train):
+# the model's own confident pixels (|LLR| > 2) retrain it, so the labels come
+# from colour and the map only says where the maze is.
+CAMERA_SEG_REFINE_ITERS = 2
 CAMERA_SEG_MIN_PIXELS = 300
 CAMERA_SEG_MIN_ACCURACY = 0.85
 
@@ -619,12 +757,20 @@ CAMERA_FIX_TRUNCATE_K = 6.0
 # Neighbouring columns see the same wall edge, so their errors are not
 # independent. The cost and the information are divided by this.
 CAMERA_FIX_COLUMN_CORRELATION = 3.0
+# Systematic row error assumed per VIEW (px), on top of the column noise:
+# a whole view's boundary can sit a pixel high or low (segmentation, JPEG's
+# half-resolution chroma, tilt repeatability). Propagated into the reported
+# std (camera_fit._bias_cov), so a geometry where one view's offset can be
+# traded for lateral or yaw is reported unobservable instead of confidently
+# wrong. 0.7 px: the median per-view offset measured in the closed loop after
+# the segmentation fixes, which ranged 0.2 - 1.0 px.
+CAMERA_FIX_VIEW_BIAS_PX = 0.7
 
 # -- Search -----------------------------------------------------------------
 # Window: under half a cell, like SCAN_FIT_MAX_SHIFT_M -- a larger error is a
 # lost pose, and a wider window mostly finds the next cell's walls.
 CAMERA_FIX_SEARCH_HALF_M = 0.10
-CAMERA_FIX_SEARCH_HALF_YAW_DEG = 6.0
+CAMERA_FIX_SEARCH_HALF_YAW_DEG = 8.0
 CAMERA_FIX_COARSE_STEP_M = 0.02
 CAMERA_FIX_COARSE_STEP_YAW_DEG = 1.0
 # The coarse grid scores with the pixel sigma multiplied by this. Near a side
@@ -665,18 +811,50 @@ CAMERA_FIX_MAX_STD_LONG_M = 0.010
 CAMERA_FIX_MAX_STD_YAW_DEG = 0.6
 CAMERA_FIX_MAX_LATERAL_M = SCAN_FIT_MAX_LATERAL_M
 CAMERA_FIX_MAX_LONG_M = 0.10
-CAMERA_FIX_MAX_YAW_DEG = 5.0
+CAMERA_FIX_MAX_YAW_DEG = 7.0
 # A second lateral hypothesis at least this far away must cost clearly more
 # (in noise units) than the best one, or lateral is ambiguous.
 CAMERA_FIX_AMBIGUITY_SEPARATION_M = 0.03
 CAMERA_FIX_AMBIGUITY_MIN_DELTA = 4.5
 # The fit must explain the image this much better than the uncorrected pose.
 CAMERA_FIX_MIN_IMPROVEMENT = 0.8
-# Below these the pose is "confirmed": nothing is applied, but lateral counts
-# as checked and the sweep is not needed.
-CAMERA_FIX_CONFIRM_M = 0.008
-CAMERA_FIX_CONFIRM_YAW_DEG = 0.4
+# Below these -- or below twice the component's own standard deviation, when
+# that is larger -- the pose is "confirmed": nothing is applied. A dead-band,
+# so a well-centred kart is not re-anchored by noise at every cell; small
+# because fine corrections are the whole job now (see CAMERA_FIX_SMALL_*).
+CAMERA_FIX_CONFIRM_M = 0.004
+CAMERA_FIX_CONFIRM_YAW_DEG = 0.25
 CAMERA_FIX_YAW_GAIN = 1.0
+
+# -- Small vs big (runner/arrival_policy.py) ---------------------------------
+# The largest correction the camera applies from one fix.
+#
+# Translation is shared with the sonar correctors. A camera reading beyond
+# these is not applied; with CAMERA_FIX_ESCALATES the closest obstacle
+# reference / sweep runs right away, at this same boundary -- the tool that
+# moves the kart physically and has been proven on the real maze. Only when it
+# cannot run here (no usable side wall, a better one scheduled ahead) does the
+# camera apply its reading clamped to these, so a known error is not left
+# standing and a wrong fit cannot move the belief by more than this.
+#
+# 3 cm sits where the two meet: the closest obstacle reference only moves the
+# kart above CLOSEST_OBSTACLE_MINIMAL_DELTA_CM (3 cm) and only re-anchors
+# above RANGE_FIX_MIN_CORRECTION_M (2 cm), so everything under 3 cm is left
+# to the camera.
+#
+# Yaw is the camera's alone -- no sonar corrector observes heading -- so it is
+# never escalated, only clamped to CAMERA_FIX_SMALL_YAW_DEG per fix. 3 deg is
+# about one turn's worth of error (1-5 deg/turn, see SWEEP_EVERY_N_LEGS); a
+# larger accumulated error is worked down over successive boundaries. That is
+# also why the search window (CAMERA_FIX_SEARCH_HALF_YAW_DEG) and the
+# plausibility gate (CAMERA_FIX_MAX_YAW_DEG) reach past it: a heading 5 deg off
+# has to be MEASURABLE to be worked down at all -- measured in the closed loop,
+# with a 6 deg window an accurate -5.5 deg reading was refused on the window
+# edge, and from then on nothing could correct the heading.
+CAMERA_FIX_SMALL_LATERAL_M = 0.03
+CAMERA_FIX_SMALL_LONG_M = 0.03
+CAMERA_FIX_SMALL_YAW_DEG = 3.0
+CAMERA_FIX_ESCALATES = True
 
 # -- Abort ------------------------------------------------------------------
 # The kart is presumed still from capture to the end of the fix.
@@ -693,7 +871,11 @@ CAMERA_FIX_LATERAL_MOVE_M = 0.03
 #                   offset with its own absolute goto (~6 deg turn1 for 3 cm
 #                   over 30 cm), while centring in place costs two turns
 #   "never"
-CAMERA_FIX_MOVE_POLICY = "before_turns"
+# "never" now that the camera only applies small corrections: physical moves
+# for large offsets are the closest obstacle reference's (it drives toward or
+# away from the side wall), and an offset under CAMERA_FIX_SMALL_LATERAL_M is
+# removed by the next leg's absolute goto anyway.
+CAMERA_FIX_MOVE_POLICY = "never"
 # How: "goto" sends the absolute goto to the centre straight away, which for a
 # mostly-lateral offset is turn ~90, creep, turn ~90 back -- the very turns
 # that create heading error. "backoff" first reverses CAMERA_FIX_BACKOFF_M

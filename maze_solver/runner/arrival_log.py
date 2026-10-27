@@ -1,12 +1,16 @@
 """
-One CSV row per cell arrival: what each corrector measured and did, and the best
-estimate of how far from the cell centre the kart really was.
+One CSV row per cell boundary: what each corrector measured and did, and the
+camera's estimate of how far from the cell centre the kart really was.
 
 The belief right after a leg is the goto's target, so hypot(belief - centre) is
-~0 by construction and measures nothing. The arrival error logged here is the
-camera-CORRECTED estimate minus the centre (longitudinal from Recenter's first
-measurement when the camera could not see that axis) -- the number that decides
-whether the corrections are working, and the one the TCC plots.
+~0 by construction and measures nothing. Two numbers here do measure:
+
+  recenter_first_cm  the sonar's longitudinal error on ARRIVAL, before any
+                     correction at this boundary
+  err_*_cm           the camera's estimate of the offset LEFT AFTER the sonar
+                     correctors (Recenter, closest obstacle reference / sweep)
+                     -- the residual the small corrections exist for, and the
+                     one the TCC plots.
 """
 from __future__ import annotations
 
@@ -21,11 +25,12 @@ FIELDS = [
     "cam_outcome", "cam_reason", "cam_views", "cam_hits", "cam_rms_px",
     "cam_long_cm", "cam_lat_cm", "cam_yaw_deg",
     "cam_std_long_cm", "cam_std_lat_cm", "cam_std_yaw_deg",
-    "err_long_cm", "err_lat_cm", "err_xy_cm", "err_long_source",
-    "moved", "move_mode", "move_blocked",
+    "err_long_cm", "err_lat_cm", "err_xy_cm",
+    "cam_applied_long_cm", "cam_applied_lat_cm", "cam_applied_yaw_deg",
+    "cam_escalated", "moved", "move_mode", "move_blocked",
     "verify_outcome", "verify_lat_cm", "verify_yaw_deg",
     "recenter_first_cm", "recenter_last_cm", "recenter_moves",
-    "sweep_used", "sweep_lateral_cm", "duration_s",
+    "big_used", "big_shift_cm", "duration_s",
 ]
 
 
@@ -65,11 +70,13 @@ class ArrivalLog:
                 if r.get("err_lat_cm") not in ("", None)]
         cam = [r for r in self.rows if r.get("cam_outcome")]
         refused = sum(1 for r in cam if r["cam_outcome"] == "recusado")
-        sweeps = sum(1 for r in self.rows if r.get("sweep_used") == "1")
+        escalated = sum(1 for r in self.rows if r.get("cam_escalated") == "1")
+        big = sum(1 for r in self.rows if r.get("big_used"))
         if not self.rows:
             return "nenhuma chegada registrada"
         out = (f"{len(self.rows)} chegada(s), camera em {len(cam)} "
-               f"({refused} recusa(s)), varredura em {sweeps}")
+               f"({refused} recusa(s), {escalated} grande(s) demais), "
+               f"correcao grande em {big}")
         if errs:
             errs.sort()
             p90 = errs[min(len(errs) - 1, int(round(0.9 * (len(errs) - 1))))]

@@ -8,4 +8,4 @@
 # center away from the body's true visual middle in just one axis. Nudge one
 # number at a time and re-run: +dx shifts the effective center further along
 # the kart's own forward axis, +dy further along its own left axis.
-KART_CENTER_OFFSET_LOCAL = (0.02,0.12)
+KART_CENTER_OFFSET_LOCAL = (0.03,0.168)

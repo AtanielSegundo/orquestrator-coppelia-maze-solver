@@ -62,6 +62,7 @@ from runner.constants import (
     CAMERA_FIX_SERVO_ACK_TIMEOUT_S, CAMERA_FIX_SERVO_SETTLE_S,
     CAMERA_FIX_VIEW_TIMEOUT_S, CAMERA_SEG_COMPONENTS, CAMERA_SEG_L_WEIGHT,
     CAMERA_SEG_LABEL_MARGIN_PX, CAMERA_SEG_MIN_ACCURACY, CAMERA_SEG_MIN_PIXELS,
+    CAMERA_SEG_REFINE_ITERS,
 )
 from runner.contact_model import predict_at, vetoed_columns
 from runner.reference_renderer import render_labels, upsample_labels
@@ -155,7 +156,8 @@ class CameraFix:
                                         l_weight=CAMERA_SEG_L_WEIGHT,
                                         margin_px=CAMERA_SEG_LABEL_MARGIN_PX,
                                         min_pixels=CAMERA_SEG_MIN_PIXELS,
-                                        min_accuracy=CAMERA_SEG_MIN_ACCURACY)
+                                        min_accuracy=CAMERA_SEG_MIN_ACCURACY,
+                                        refine_iters=CAMERA_SEG_REFINE_ITERS)
 
     # -- head ----------------------------------------------------------------
     def _command(self, pan_pct: int) -> None:

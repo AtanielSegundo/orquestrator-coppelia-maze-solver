@@ -15,6 +15,8 @@ class PATHS:
     KART_SHADOW = os.path.join(_ROOT, "kart_shadow.ttt")
     ASSETS = os.path.join(_ROOT, "assets")
     MAZES  = os.path.join(_ROOT, "saecollab", "mazes")
+    # checkout with dynamic_maze_start_goal.py, for --rl (src/solver/solve_rl.py)
+    RL_LIB = r"C:\Users\Korvo\scripts\maze_impl"
 
 @dataclass
 class LOG:

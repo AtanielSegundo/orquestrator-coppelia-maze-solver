@@ -201,40 +201,74 @@ class TestFloorSegmenter(unittest.TestCase):
         self.assertIn("parecidas", why)
 
 
-def _fit(outcome=CORRECTED, lat=0.04, lng=0.01, yaw=0.02):
+def _fit(outcome=CORRECTED, lat=0.02, lng=0.01, yaw=0.02):
+    """A fit inside the camera's small range by default (2 cm, 1 cm, 1.1 deg)."""
     return CameraFit(outcome, "", lng, lat, yaw, (lng or 0, lat or 0, yaw or 0),
                      (0.001, 0.001, 0.001), {}, 1.0, 10.0, 1.0, 100, 100, 1.0,
                      0.5, ("frente",))
 
 
 class TestArrivalPolicy(unittest.TestCase):
+    """The camera makes the SMALL corrections. Translation beyond them is the
+    closest obstacle reference / sweep's (escalated); yaw has no other
+    corrector, so it is always applied, clamped."""
 
     def test_refused_or_confirmed_apply_nothing(self):
         self.assertEqual(plan_after_camera(None, 0.0, MEASURE, 0, False), NOTHING)
         self.assertEqual(plan_after_camera(_fit(REFUSED), 0.05, MEASURE, 90, False), NOTHING)
         self.assertEqual(plan_after_camera(_fit(CONFIRMED), 0.05, MEASURE, 90, False), NOTHING)
 
-    def test_longitudinal_waits_for_recenter_unless_the_kart_moves(self):
-        d = plan_after_camera(_fit(), 0.01, MEASURE, 0, False, policy="always")
-        self.assertTrue(d.apply_lat and d.apply_yaw)
-        self.assertFalse(d.move)
-        self.assertFalse(d.apply_long_now)
-        self.assertTrue(d.stash_long)
-        d = plan_after_camera(_fit(), 0.05, MEASURE, 0, False, policy="always")
-        self.assertTrue(d.move and d.apply_long_now and not d.stash_long)
+    def test_small_fit_is_applied_whole(self):
+        """Longitudinal too: Recenter has already driven that axis against the
+        sonar by the time the camera looks, so what is left is a residual."""
+        d = plan_after_camera(_fit(), 0.0, MEASURE, 0, False, policy="never")
+        self.assertEqual((d.longitudinal, d.lateral, d.yaw), (0.01, 0.02, 0.02))
+        self.assertFalse(d.move or d.escalate)
 
-    def test_before_turns_policy(self):
-        straight = plan_after_camera(_fit(), 0.05, MEASURE, 0, False, policy="before_turns")
-        turning = plan_after_camera(_fit(), 0.05, MEASURE, 90, False, policy="before_turns")
-        at_goal = plan_after_camera(_fit(), 0.05, MEASURE, 0, True, policy="before_turns")
-        self.assertFalse(straight.move)
-        self.assertTrue(turning.move)
-        self.assertTrue(at_goal.move)
+    def test_big_translation_escalates_with_a_clamped_fallback(self):
+        for lat, lng in ((0.05, 0.01), (0.01, -0.06)):
+            d = plan_after_camera(_fit(lat=lat, lng=lng), 0.0, MEASURE, 0, False)
+            self.assertTrue(d.escalate)
+            self.assertEqual((d.longitudinal, d.lateral), (0.0, 0.0))
+            self.assertAlmostEqual(d.yaw, 0.02)          # yaw still applied
+            fl, fb = d.fallback
+            self.assertLessEqual(abs(fl), 0.03 + 1e-12)
+            self.assertLessEqual(abs(fb), 0.03 + 1e-12)
+            self.assertEqual(math.copysign(1, fb), math.copysign(1, lat))
+
+    def test_big_yaw_is_clamped_not_escalated(self):
+        """No sonar corrector observes heading: escalating it would be
+        escalating to nobody."""
+        d = plan_after_camera(_fit(yaw=math.radians(5.0)), 0.0, MEASURE, 0, False)
+        self.assertFalse(d.escalate)
+        self.assertAlmostEqual(d.yaw, math.radians(3.0))
+        self.assertEqual(d.lateral, 0.02)
+
+    def test_unobservable_components_are_not_applied(self):
+        d = plan_after_camera(_fit(lng=None, yaw=None), 0.0, MEASURE, 0, False)
+        self.assertEqual((d.longitudinal, d.lateral, d.yaw), (0.0, 0.02, 0.0))
+        self.assertFalse(d.escalate)
+
+    def test_small_bounds_can_be_overridden(self):
+        d = plan_after_camera(_fit(lat=0.04), 0.0, MEASURE, 0, False,
+                              small_lat_m=0.05)
+        self.assertEqual(d.lateral, 0.04)
+        self.assertFalse(d.escalate)
+
+    def test_move_policies(self):
+        """The centring move (off by default) still follows its policy for a
+        small fit whose CORRECTED pose sits far enough off the axis."""
+        args = (_fit(), 0.035, MEASURE)
+        self.assertTrue(plan_after_camera(*args, 0, False, policy="always").move)
+        self.assertFalse(plan_after_camera(*args, 0, False, policy="before_turns").move)
+        self.assertTrue(plan_after_camera(*args, 90, False, policy="before_turns").move)
+        self.assertTrue(plan_after_camera(*args, 0, True, policy="before_turns").move)
+        self.assertFalse(plan_after_camera(*args, 90, True, policy="never").move)
 
     def test_verify_pass_never_moves(self):
         d = plan_after_camera(_fit(), 0.06, VERIFY, 90, True, policy="always")
         self.assertFalse(d.move)
-        self.assertTrue(d.apply_lat)
+        self.assertEqual(d.lateral, 0.02)
 
 
 class FakeKart:

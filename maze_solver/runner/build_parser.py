@@ -32,7 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-wstp","--wait_to_step",action="store_true", default=False,
                    help="Flag para que o proximo passo do orquestradot tenha validação manual"
                    )
-    p.add_argument("--video", choices=("sim", "client", "off"), 
+    p.add_argument("--rl", metavar="MODEL_PATH", default=None,
+                   help="modelo .pth (ou diretorio do treino) de "
+                        "dynamic_maze_start_goal.py para planejar no lugar "
+                        "do BFS (default: BFS)")
+    p.add_argument("--video", choices=("sim", "client", "off"),
                    default="sim",
                    help="stream producer -- ver camera_link/ "
                         "(default: %(default)s)")
