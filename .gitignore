@@ -1,2 +1,4 @@
 __pycache__/
 *.csv
+# camera pose fix: per-arrival CSVs and debug PNGs
+maze_solver/logs/
