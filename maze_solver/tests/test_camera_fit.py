@@ -37,7 +37,7 @@ from runner.wall_world import build_wall_world                           # noqa:
 from src.renders import MazeView                                         # noqa: E402
 from src.solver import heading_between, solve_bfs                        # noqa: E402
 
-PARAMS = FitParams(yield_s=0.0)
+PARAMS = FitParams(yield_s=0.0, gated=True)
 
 
 def run(maze, cell, heading, a, b, yaw, pan_err=None, noise=0.0, seed=0):
@@ -88,6 +88,41 @@ class TestStubGeometry(unittest.TestCase):
                 fit = run(maze, cell, 0.0, 0.0, b, 0.0)
                 self.assertEqual(fit.outcome, REFUSED, f"{type(maze).__name__} {b}")
                 self.assertIsNone(fit.lateral)
+
+
+class TestStepMode(unittest.TestCase):
+    """Ungated (step mode): what a gate would refuse still hands back its raw
+    estimate, marked as low confidence; only "no data" is refused."""
+
+    UNGATED = FitParams(yield_s=0.0, gated=False)
+
+    def test_gate_refusal_becomes_a_low_confidence_estimate(self):
+        world = build_wall_world(Corridor(), ORIGIN, CELL)
+        truth = offset_pose((1, 3), 0.0, 0.0, 0.11, 0.0)
+        believed = offset_pose((1, 3), 0.0, 0.0, 0.0, 0.0)
+        meas = measure(world, truth, None, 0.0, np.random.default_rng(0))
+        gated = fit_camera_pose(meas, world, believed, PARAMS)
+        self.assertEqual(gated.outcome, REFUSED)
+        fit = fit_camera_pose(meas, world, believed, self.UNGATED)
+        self.assertEqual(fit.outcome, CORRECTED)
+        self.assertIn("baixa confianca", fit.reason)
+        self.assertEqual((fit.longitudinal, fit.lateral, fit.yaw), fit.estimate)
+        self.assertGreater(fit.lateral, 0.0)          # at least the right way
+
+    def test_no_data_is_still_refused(self):
+        world = build_wall_world(OpenField(), ORIGIN, CELL)
+        meas = measure(world, offset_pose((3, 3), 0.0, 0.01, 0.02, 1.0), None,
+                       0.0, np.random.default_rng(0))
+        fit = fit_camera_pose(meas, world, offset_pose((3, 3), 0.0, 0, 0, 0),
+                              self.UNGATED)
+        self.assertEqual(fit.outcome, REFUSED)
+
+    def test_centred_kart_is_confirmed(self):
+        world = build_wall_world(Pillars(), ORIGIN, CELL)
+        pose = offset_pose((2, 2), 0.0, 0.0, 0.0, 0.0)
+        meas = measure(world, pose, None, 0.0, np.random.default_rng(0))
+        fit = fit_camera_pose(meas, world, pose, self.UNGATED)
+        self.assertEqual(fit.outcome, CONFIRMED, fit.reason)
 
 
 class TestOverTccPath(unittest.TestCase):

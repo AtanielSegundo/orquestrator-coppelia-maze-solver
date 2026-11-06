@@ -56,6 +56,10 @@ Then the gates (`_judge`): enough columns, residuals the model explains, the
 optimum not on the edge of the window, no second lateral hypothesis nearly as
 good, plausible magnitudes, and a real improvement over the uncorrected pose.
 
+In step mode (CAMERA_FIX_STEP_MODE, the default) those gates are REPORTED, not
+enforced: the fit hands back its raw estimate on every axis and the caller
+applies only a bounded step of it (runner/arrival_policy.py).
+
 Everything here is plain numpy and touches no I/O, so it is tested against
 synthetic frames with no kart and no simulator.
 """
@@ -82,7 +86,8 @@ from runner.constants import (
     CAMERA_FIX_MIN_IMPROVEMENT, CAMERA_FIX_MIN_INLIER_FRACTION,
     CAMERA_FIX_PAN_NUISANCE_HALF_DEG, CAMERA_FIX_PAN_NUISANCE_SIGMA_DEG,
     CAMERA_FIX_PIXEL_SIGMA_PX, CAMERA_FIX_SEARCH_HALF_M,
-    CAMERA_FIX_SEARCH_HALF_YAW_DEG, CAMERA_FIX_TRANSLATION_PRIOR_M,
+    CAMERA_FIX_SEARCH_HALF_YAW_DEG, CAMERA_FIX_STEP_MODE,
+    CAMERA_FIX_TRANSLATION_PRIOR_M,
     CAMERA_FIX_TRUNCATE_K, CAMERA_FIX_VIEW_BIAS_PX, CAMERA_FIX_YAW_PRIOR_DEG,
     SCAN_FIT_YIELD_S,
 )
@@ -131,6 +136,8 @@ class FitParams:
     confirm_yaw_deg: float = CAMERA_FIX_CONFIRM_YAW_DEG
     view_bias_px: float = CAMERA_FIX_VIEW_BIAS_PX
     yield_s: float = SCAN_FIT_YIELD_S
+    # False (step mode): the gates are reported, not enforced -- see _judge.
+    gated: bool = not CAMERA_FIX_STEP_MODE
 
 
 class ViewMeasurement(NamedTuple):
@@ -171,8 +178,8 @@ class CameraFit(NamedTuple):
         if self.outcome == REFUSED:
             return f"recusado: {self.reason} | {head}"
         if self.outcome == CONFIRMED:
-            return f"confirmado | {head}"
-        return head
+            head = f"confirmado | {head}"
+        return f"{head} | {self.reason}" if self.reason else head
 
 
 def _rho(e: np.ndarray, k: float, trunc: float) -> np.ndarray:
@@ -608,6 +615,25 @@ class CameraFitter:
         return total
 
     def _judge(self, sol: _Solution, others: Sequence[_Solution], hits: int) -> CameraFit:
+        """The gated verdict, or -- in step mode (`gated` False) -- the raw
+        estimate on every axis, whatever the gates say. The caller applies only
+        a bounded step of it (arrival_policy), so a low-confidence fit can
+        nudge the belief but never move it far; what a gate would have said is
+        kept in `reason`. Only a deadband (CONFIRM_*, no std term) still keeps
+        a centred kart from being re-anchored by noise."""
+        fit = self._judge_gated(sol, others, hits)
+        if self.p.gated:
+            return fit
+        a, b, psi = fit.estimate
+        p = self.p
+        small = (abs(a) < p.confirm_m and abs(b) < p.confirm_m
+                 and abs(psi) < math.radians(p.confirm_yaw_deg))
+        reason = f"baixa confianca: {fit.reason}" if fit.outcome == REFUSED else fit.reason
+        return fit._replace(outcome=CONFIRMED if small else CORRECTED, reason=reason,
+                            longitudinal=a, lateral=b, yaw=psi)
+
+    def _judge_gated(self, sol: _Solution, others: Sequence[_Solution],
+                     hits: int) -> CameraFit:
         p = self.p
         a, b, psi = (float(v) for v in sol.x[:3])
         est = (a, b, psi)

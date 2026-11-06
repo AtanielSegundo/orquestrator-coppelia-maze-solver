@@ -27,10 +27,14 @@ from runner.constants import (
     ARRIVAL_LOG_ENABLED, CAMERA_FIX_AT_START, CAMERA_FIX_DEBUG_DUMP,
     CAMERA_FIX_ENABLED, CAMERA_FIX_ESCALATES, CAMERA_FIX_HOLD_TILT,
     CAMERA_FIX_MOVE_MODE, CAMERA_FIX_REVERIFY, CAMERA_FIX_YAW_GAIN,
+    CAMERA_V2_AT_START, CAMERA_V2_ENABLED, CAMERA_V2_EVERY_N_CELLS,
+    CAMERA_V2_MAX_NEXT_BEST_CELLS,
 )
 from runner.arrival_log import ArrivalLog, _cm, _deg
 from runner.arrival_policy import MEASURE, START, VERIFY, plan_after_camera
+from runner.camera_cells import camera_cell, find_camera_cell
 from runner.camera_fix import CameraFix
+from runner.camera_fix_v2 import CameraFixV2
 from runner.camera_setup import build_view_geometries, load_camera_calibration
 from runner.center_move import CenterMove
 from runner.closest_obstacle import (ClosestObstacleFix, better_side,
@@ -91,6 +95,8 @@ class LiveMazeRunner:
     _needs_start_fix = False
     last_camera_summary = ""
     camera_fixes_done = 0
+    _cells_since_camera = 0
+    _camera_next = None
 
     def __init__(self, sim, kart_base, motors, maze_path: str,
                 view: MazeView, kart_view: KartView,
@@ -173,6 +179,11 @@ class LiveMazeRunner:
         self._side_ref_scheduled = False
         
         self._cells_since_sweep = 0     # cells, not legs -- see SWEEP_EVERY_N_LEGS
+        # Camera pose fix v2 (CAMERA_V2_ENABLED): cells since the last one, and
+        # the cell ahead it was postponed to, as (plan index, cell) -- legs are
+        # one cell long while that is set (runner/camera_cells.py).
+        self._cells_since_camera = 0
+        self._camera_next: Optional[Tuple[int, Tuple[int, int]]] = None
         self.sweeps_done = 0
         self.last_sweep_summary = ""
 
@@ -380,6 +391,7 @@ class LiveMazeRunner:
         "ready". Re-run by step() whenever the sensor changes the live maze
         while the kart waits, so the route on display is the one 'ok' drives."""
         self._cancel_next_best("novo goal")
+        self._cancel_camera_next("novo goal")
         self._on_bfs_fallback = False
         path = self._solve(self.start_cell, self.goal_cell)
         self.plan_path  = path
@@ -512,6 +524,7 @@ class LiveMazeRunner:
         # A postponed side reference names a plan index; a new plan makes it
         # meaningless. The next boundary looks again on the new path.
         self._cancel_next_best("replanejado")
+        self._cancel_camera_next("replanejado")
         self._on_bfs_fallback = False
         if self.waypoint is not None:
             via, self.waypoint = self.waypoint, None
@@ -905,6 +918,7 @@ class LiveMazeRunner:
         self.visited.extend(self.plan_path[first:first + cells])
         self.plan_index += cells
         self._cells_since_sweep += cells
+        self._cells_since_camera += cells
 
     def _carve_free(self, wx, wy, wth, length, hit_cell):
         """Un-discover the cells this reading just proved empty.
@@ -1371,7 +1385,8 @@ class LiveMazeRunner:
                                        self.center_move)):
             print("[ERROR] camfix: espere o kart parar (perna/correcao em curso)")
             return False
-        self.camera_fix = self._make_camera_fix("manual")
+        self.camera_fix = (self._make_camera_v2("manual", act=False) if CAMERA_V2_ENABLED
+                           else self._make_camera_fix("manual"))
         return True
 
     def _replace_views(self, wx, wy, wth):
@@ -1399,10 +1414,13 @@ class LiveMazeRunner:
                          "t0": time.monotonic()}
         if kind == START:
             self._arrival["camera_started"] = True
-            if self._camera_ready():
-                self.camera_fix = self._make_camera_fix(START)
-            else:
+            if not self._camera_ready():
                 self._arrival = None
+            elif CAMERA_V2_ENABLED:
+                if not (CAMERA_V2_AT_START and self._start_camera_v2(START, wx, wy, wth)):
+                    self._arrival = None
+            else:
+                self.camera_fix = self._make_camera_fix(START)
             return
         self._start_recenter(wx, wy, wth)
 
@@ -1414,7 +1432,13 @@ class LiveMazeRunner:
                 or self.sweep is not None or self.side_ref is not None):
             return
         arr["camera_started"] = True
-        if self._camera_ready():
+        if not self._camera_ready():
+            return
+        if CAMERA_V2_ENABLED:
+            pose = getattr(self, "last_world_pose", None)
+            if pose is not None:
+                self._start_camera_v2(MEASURE, *pose)
+        else:
             self.camera_fix = self._make_camera_fix(MEASURE)
 
     def _note_big(self, kind: str, shift_m: float):
@@ -1435,8 +1459,103 @@ class LiveMazeRunner:
         cx, cy, _ = cop.cell_to_world(self.origin, self.cell_length, cell)
         return (px - cx) * -s + (py - cy) * c
 
+    # ---- camera pose fix v2 (runner/camera_fix_v2.py) -----------------------
+    #
+    # Scheduled like NEXT_BEST_CLOSEST_AS_REFERENCE: due every
+    # CAMERA_V2_EVERY_N_CELLS cells, it runs at the current boundary if the
+    # cell suits it (runner/camera_cells.py); otherwise the first suitable
+    # cell within CAMERA_V2_MAX_NEXT_BEST_CELLS on the plan is chosen and legs
+    # drop to one cell until it is reached. Nothing suitable: it stays due.
+    def _make_camera_v2(self, purpose: str, act: bool = True) -> CameraFixV2:
+        world = build_wall_world(self.view, self.origin, self.cell_length,
+                                 inset=self.camera_calib.wall_inset_m,
+                                 box_height=self.camera_calib.box_height_m)
+        dump = os.path.join(_LOG_DIR, "camera") if CAMERA_FIX_DEBUG_DUMP else None
+        return CameraFixV2(self.camera_calib, self.camera, self.camera_stream,
+                           self.link, world, self.odom_ref, purpose=purpose, act=act,
+                           on_step=self._apply_camera_v2_step,
+                           turn_speed=self.turn_speed, dump_dir=dump)
+
+    def _start_camera_v2(self, purpose: str, wx, wy, wth) -> bool:
+        """Start the v2 fix here if it is due and this cell suits it, or
+        postpone it to a suitable cell ahead. True when it started."""
+        cell = self._nearest_cell(wx, wy)
+        forced = False
+        if self._camera_next is not None:
+            index, target = self._camera_next
+            if self.plan_index < index:
+                return False                    # not there yet: on, one cell at a time
+            self._camera_next = None
+            forced = self.plan_index == index and self.plan_path[index] == target
+        elif purpose != START and self._cells_since_camera < CAMERA_V2_EVERY_N_CELLS:
+            return False
+        if not forced:
+            quality = camera_cell(self.view, cell, wth)
+            if not quality.ok:
+                if purpose == START:
+                    self.last_camera_summary = f"inicio: celula ruim para a camera ({quality.reason})"
+                    return False
+                found = find_camera_cell(self.view, self.plan_path, self.plan_index,
+                                         CAMERA_V2_MAX_NEXT_BEST_CELLS)
+                if found is None:
+                    # Stays due: the next boundary looks again.
+                    self.last_camera_summary = (f"devida, sem celula boa nas proximas "
+                                                f"{CAMERA_V2_MAX_NEXT_BEST_CELLS} ({cell}: "
+                                                f"{quality.reason})")
+                    return False
+                self._camera_next = (found, self.plan_path[found])
+                self.last_camera_summary = (f"adiada para {self.plan_path[found]} "
+                                            f"({cell}: {quality.reason})")
+                print(f"[INFO] camera v2 {self.last_camera_summary} -- uma celula por vez ate la")
+                return False
+        self.camera_fix = self._make_camera_v2(purpose)
+        return True
+
+    def _cancel_camera_next(self, why):
+        if self._camera_next is not None:
+            print(f"[INFO] camera v2 adiada para {self._camera_next[1]} cancelada ({why})")
+            self._camera_next = None
+
+    def _apply_camera_v2_step(self, rel, capture_pose, a, psi):
+        """Re-anchor the belief by `a` along the capture heading and `psi` of
+        heading (CameraFixV2 then turns the kart back onto the axis)."""
+        x0, y0, th0 = self.mirror.world_pose_of(rel)
+        c, s = math.cos(capture_pose[2]), math.sin(capture_pose[2])
+        corrected = (x0 + c * a, y0 + s * a, th0 + psi)
+        self.mirror.reanchor(rel, corrected)
+        if self._arrival is not None:
+            pa, pb, ppsi = self._arrival.get("applied", (0.0, 0.0, 0.0))
+            self._arrival["applied"] = (pa + a, pb, ppsi + psi)
+        self._replace_views(*corrected)
+
+    def _poll_camera_v2(self, drive_tel, odom, wx, wy, wth):
+        fix = self.camera_fix
+        outcome = fix.poll(drive_tel, odom, wx, wy, wth)
+        if outcome == "pending":
+            self.status = f"camera v2: {fix.status}"
+            return
+        self.camera_fix = None
+        res = fix.result
+        self.last_camera_summary = res.summary()
+        if fix.purpose == "manual":
+            print(f"[INFO] camfix v2 (so medida, nada aplicado): {res.summary()}")
+            for line in fix.group_lines():
+                print(f"       {line}")
+            return
+        # Ran (whatever came of it): the interval restarts, as after a
+        # postponed closest obstacle reference.
+        self._cells_since_camera = 0
+        if self._arrival is not None:
+            self._arrival["camera_v2"] = res
+        if res.applied_long or res.applied_yaw or res.turned_deg:
+            self.camera_fixes_done += 1
+        print(f"[INFO] camera v2 ({fix.purpose}): {res.summary()}")
+
     def _poll_camera_fix(self, drive_tel, odom, wx, wy, wth):
         fix = self.camera_fix
+        if isinstance(fix, CameraFixV2):
+            self._poll_camera_v2(drive_tel, odom, wx, wy, wth)
+            return
         outcome = fix.poll(drive_tel, odom, wx, wy, wth)
         if outcome == "pending":
             self.status = f"camera: {fix.status}"
@@ -1458,6 +1577,10 @@ class LiveMazeRunner:
         decision = plan_after_camera(fit, offset, fix.purpose,
                                      self._next_turn_deg(wth), at_goal)
         print(f"[INFO] camera ({fix.purpose}): {res.summary()}")
+        if decision.applies:
+            print(f"[INFO] camera: passo aplicado long {decision.longitudinal * 100:+.1f} cm, "
+                  f"lat {decision.lateral * 100:+.1f} cm, "
+                  f"yaw {math.degrees(decision.yaw):+.2f} deg")
         wx, wy, wth = self._apply_camera_fix(res, decision.longitudinal,
                                              decision.lateral, decision.yaw, odom)
         if decision.applies or (decision.escalate and any(decision.fallback)):
@@ -1564,6 +1687,15 @@ class LiveMazeRunner:
         res = arr.get("camera")
         if res is not None:
             row.update(cam_outcome=res.outcome, cam_reason=res.reason)
+        v2 = arr.get("camera_v2")
+        if v2 is not None:
+            row.update(cam_outcome=v2.outcome, cam_reason=v2.summary())
+            if v2.iterations:
+                last = v2.iterations[-1]
+                row.update(cam_long_cm=_cm(last.long), cam_lat_cm=_cm(last.lat),
+                           cam_yaw_deg=_deg(last.yaw), cam_std_long_cm=_cm(last.std[1]),
+                           cam_std_yaw_deg=_deg(last.std[0]), cam_hits=last.n_points,
+                           cam_rms_px=f"{last.rms_px:.2f}")
         if res is not None and res.fit is not None and res.capture_pose is not None:
             fit = res.fit
             x0, y0, th0 = res.capture_pose
@@ -1660,8 +1792,9 @@ class LiveMazeRunner:
             # A straight stretch is one leg: one goto to the far centre, no
             # stop on the cells in between (see LEG_MAX_CELLS; 1 while a
             # postponed side reference is still ahead).
+            max_cells = 1 if self._camera_next is not None else self._leg_max_cells
             to = self.plan_path[straight_run_end(self.plan_path, self.plan_index,
-                                                 self._leg_max_cells)]
+                                                 max_cells)]
 
             # Gate AFTER recentring/sweep (they returned above) and the replan,
             # so the operator releases the leg that will really be driven, from

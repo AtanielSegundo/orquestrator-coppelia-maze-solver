@@ -26,13 +26,18 @@ UNKNOWN = 2          # above the horizon, outside the maze, beyond the range
 
 
 def render_labels(pinhole, pose, world: WallWorld, max_range: float = None,
-                  stride: int = 1, extra_boxes: np.ndarray = None) -> np.ndarray:
+                  stride: int = 1, extra_boxes: np.ndarray = None,
+                  return_t: bool = False):
     """Label image (H/stride, W/stride) int8 of what the camera of `pinhole`
     sees with the kart at `pose` (x, y, theta).
 
     `extra_boxes` are rendered as walls too (discovered obstacles are real
     boxes, so a frame of the real scene shows them). `max_range` (from the
     camera foot) turns further floor into UNKNOWN.
+
+    `return_t` also returns, per pixel, the ray parameter of the WALL hit
+    (inf elsewhere): the hit is C + t * ray, `ray` being `pinhole.rays(u, v)`
+    -- what the camera fix v2 recovers each edge's 3-D point from.
     """
     H, W = pinhole.height, pinhole.width
     us = np.arange(0, W, stride, dtype=float)
@@ -89,6 +94,8 @@ def render_labels(pinhole, pose, world: WallWorld, max_range: float = None,
         with np.errstate(invalid="ignore"):
             floor &= np.hypot(qx - fx, qy - fy) <= max_range
     labels[floor] = FLOOR
+    if return_t:
+        return labels, np.where(wall, t_wall, np.inf)
     return labels
 
 

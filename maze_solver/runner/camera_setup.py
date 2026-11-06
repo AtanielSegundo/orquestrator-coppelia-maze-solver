@@ -10,9 +10,10 @@ run, and exactly what `camera_calibrate.py` refines.
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from camera_link.camera_calibration import CameraCalibration, ViewCalibration
+from camera_link.camera_calibration import (CameraCalibration, TiltCalibration,
+                                            ViewCalibration)
 from camera_link.pinhole_view import PinholeView
 
 from runner.constants import (
@@ -24,7 +25,8 @@ from runner.constants import (
     CAMERA_LENS_LATERAL_M, CAMERA_PAN_ARM_M, CAMERA_PAN_HOME_PCT,
     CAMERA_PAN_LEFT_IS_HIGHER, CAMERA_PIXEL_UM, CAMERA_SENSOR_CROP_PX,
     CAMERA_SERVO_DEG_PER_PCT, CAMERA_STREAM_SIZE, CAMERA_TILT_DOWN_IS_LOWER,
-    CAMERA_TILT_HOME_PCT,
+    CAMERA_TILT_HOME_PCT, CAMERA_V2_PAN_ORDER, CAMERA_V2_TILT_ORDER,
+    CAMERA_V2_TILT_UP_PCT,
 )
 from runner.view_geometry import ViewGeometry, build_view_geometry
 
@@ -61,7 +63,13 @@ def default_calibration() -> CameraCalibration:
         pan_arm_m=CAMERA_PAN_ARM_M, pitch_deg=fix_pitch_deg(),
         tilt_pct=CAMERA_FIX_TILT_PCT, pan_home_pct=CAMERA_PAN_HOME_PCT,
         deg_per_pct=CAMERA_SERVO_DEG_PER_PCT,
-        pan_left_is_higher=CAMERA_PAN_LEFT_IS_HIGHER, views=views)
+        pan_left_is_higher=CAMERA_PAN_LEFT_IS_HIGHER, views=views,
+        tilt_deg_per_pct=CAMERA_SERVO_DEG_PER_PCT,
+        tilt_down_is_higher=not CAMERA_TILT_DOWN_IS_LOWER,
+        # v2's two tilts: "baixo" IS the held tilt (whatever the file says it
+        # is), "cima" is derived from it until `extrinsics` measures it.
+        tilts=[TiltCalibration("baixo"),
+               TiltCalibration("cima", tilt_pct=CAMERA_V2_TILT_UP_PCT)])
 
 
 def resolve_calib_path(path: Optional[str]) -> Optional[str]:
@@ -97,3 +105,21 @@ def build_view_geometries(calib: CameraCalibration,
             view.name, pin, view.ignore_bottom_px, max_range_m, col_step,
             row_step, CAMERA_FIX_BEARING_STEP_DEG, nuisance=view.nuisance)
     return out
+
+
+# -- camera pose fix v2 -------------------------------------------------------
+def v2_views(calib: CameraCalibration,
+             pans=CAMERA_V2_PAN_ORDER, tilts=CAMERA_V2_TILT_ORDER) -> List[ViewCalibration]:
+    """The v2 views in VISITING order: for each pan, each tilt (up, then
+    down). A pan or tilt the calibration does not have is skipped."""
+    names = {v.name for v in calib.views}
+    have = {t.name for t in calib.tilts}
+    return [calib.head_view(calib.view(p), t)
+            for p in pans if p in names for t in tilts if t in have]
+
+
+def v2_pinholes(calib: CameraCalibration, views: Optional[List[ViewCalibration]] = None,
+                **extra) -> Dict[str, PinholeView]:
+    views = v2_views(calib) if views is None else views
+    return {v.name: PinholeView.from_calibration(calib, v, **extra) for v in views}
+

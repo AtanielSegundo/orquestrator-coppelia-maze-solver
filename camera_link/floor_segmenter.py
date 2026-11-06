@@ -140,6 +140,47 @@ class FloorSegmenter:
                           f"(acerto {accuracy * 100:.0f}%)")
         return model, ""
 
+    def cluster_labels(self, bgr: np.ndarray, labels: np.ndarray,
+                       exclude: Optional[np.ndarray] = None, k: int = 4,
+                       max_samples: int = 20000,
+                       min_contrast: float = 0.1) -> Optional[np.ndarray]:
+        """Labels from the COLOURS, with the prediction only voting: k-means
+        on the features, then a colour cluster is wall when its share of
+        predicted-wall pixels is in the upper half of the clusters' range.
+        Unlike eroded seeds, this stays right when the prediction is degrees
+        off (the bench calibration starts that way: a pitch 20 deg out labels
+        half a box face "room"), as long as the box colours sit MORE in the
+        predicted wall than the others. Relative, not "> 50%": a view the
+        prediction calls wall almost everywhere would make every cluster wall.
+        None when no cluster stands out (contrast under `min_contrast`)."""
+        feats = self.features(bgr).reshape(-1, 3)
+        use = np.ones(feats.shape[0], dtype=bool)
+        if exclude is not None:
+            use &= ~exclude.reshape(-1)
+        idx = np.flatnonzero(use)
+        if idx.size > max_samples:
+            idx = self._rng.choice(idx, max_samples, replace=False)
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
+        _c, _l, centres = cv2.kmeans(feats[idx].astype(np.float32), k, None, crit, 3,
+                                     cv2.KMEANS_PP_CENTERS)
+        d = ((feats[:, None, :] - centres[None, :, :]) ** 2).sum(axis=2)
+        assign = np.argmin(d, axis=1)
+        pred = labels.reshape(-1) == WALL_LABEL
+        frac = np.full(k, np.nan)
+        for c in range(k):
+            m = (assign == c) & use
+            if np.count_nonzero(m) >= self.min_pixels:
+                frac[c] = float(np.mean(pred[m]))
+        ok = np.isfinite(frac)
+        if np.count_nonzero(ok) < 2:
+            return None
+        lo, hi = float(np.min(frac[ok])), float(np.max(frac[ok]))
+        if hi - lo < min_contrast:
+            return None
+        wall_cluster = np.where(ok, frac > 0.5 * (lo + hi), False)
+        out = np.where(wall_cluster[assign], WALL_LABEL, FLOOR_LABEL).astype(np.int8)
+        return out.reshape(labels.shape)
+
     def _llr_flat(self, X: np.ndarray, model: SegmenterModel) -> np.ndarray:
         return model.wall.loglik(X) - model.floor.loglik(X) + model.log_prior_ratio
 

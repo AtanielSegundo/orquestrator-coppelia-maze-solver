@@ -676,18 +676,20 @@ CAMERA_PAN_ARM_M = 0.025
 CAMERA_PAN_HOME_PCT = 50
 CAMERA_TILT_HOME_PCT = 37
 CAMERA_SERVO_DEG_PER_PCT = 1.0
-# Direction conventions, as wired by the arrow keys in main.py (LEFT raises
-# pan, DOWN lowers tilt). Check both on the bench with the overlay tool -- a
+# Direction conventions. Check both on the bench with the overlay tool -- a
 # wrong sign shows as a mirrored or inverted model, not as a subtle error.
+# Tilt measured on the real kart (2026-11-04): 37 is level, 62 looks down at
+# the floor and 12 looks UP at the ceiling, so a HIGHER tilt is down -- the
+# opposite of the arrow keys' "DOWN lowers tilt" in main.py.
 CAMERA_PAN_LEFT_IS_HIGHER = True
-CAMERA_TILT_DOWN_IS_LOWER = True
+CAMERA_TILT_DOWN_IS_LOWER = False
 
 # Tilt held during fixes. Level, the floor contacts nearer than ~0.33 m fall
 # below the image, and those are the ones with the best resolution: with the
 # lens only 10 cm up, a contact moves f*h/r^2 px per metre -- 4 px/cm at
-# 0.3 m but 0.5 px/cm at 0.9 m. Pitched 25 deg down (12 = 37 - 25) the image
+# 0.3 m but 0.5 px/cm at 0.9 m. Pitched 25 deg down (62 = 37 + 25) the image
 # spans the floor from ~0.10 m ahead of the lens to past the range limit.
-CAMERA_FIX_TILT_PCT = 12
+CAMERA_FIX_TILT_PCT = 62
 
 # Views, as (name, pan in degrees relative to home, + = left). The side views
 # look straight at the current cell's own side walls, which is where lateral
@@ -856,6 +858,36 @@ CAMERA_FIX_SMALL_LONG_M = 0.03
 CAMERA_FIX_SMALL_YAW_DEG = 3.0
 CAMERA_FIX_ESCALATES = True
 
+# -- Step mode (replaces the gates and the small-vs-big table above) ---------
+# The camera only ever NUDGES the belief: every fix applies a bounded fraction
+# of its estimate, whatever the fit's confidence, and never escalates. The
+# reference swapping (closest obstacle reference / sweep) already removes the
+# gross errors; inside the 2 cm radius around the cell centre the kart is
+# still well localised, so a step of at most CAMERA_FIX_STEP_M can never push
+# a well-placed kart out of it on its own, and a consistent reading is worked
+# down over successive boundaries. Full precision is traded for that bound.
+#
+# With step mode on, the fit's quality gates (observability, inliers, window
+# edge, ambiguity, magnitude, improvement) are only reported, not enforced;
+# a fit is refused only when there is no data at all (no usable view, too few
+# contacts). False restores the gated behaviour above.
+CAMERA_FIX_STEP_MODE = True
+# Fraction of the estimate applied per fix, per axis.
+CAMERA_FIX_STEP_GAIN_LONG = 0.5
+CAMERA_FIX_STEP_GAIN_LAT = 0.5
+CAMERA_FIX_STEP_GAIN_YAW = 0.5
+# Largest step per fix: translation (norm of long+lat) and yaw. Both halved
+# (1 cm -> 0.5 cm, 2 deg -> 1 deg) after bench runs on the real kart
+# (2026-11-05). Trade-off: in tests/test_camera_closed_loop.py (3 deg/turn) a
+# 1 deg yaw cap let the departure from the centre line reach ~2.5 cm, where
+# 2 deg kept it under 2 cm (that test was tuned with 1 cm / 2 deg).
+CAMERA_FIX_STEP_M = 0.005
+CAMERA_FIX_STEP_YAW_DEG = 1.0
+# Sign of the applied yaw step: +1 corrects in the direction measured (what
+# the simulated closed loop wants); -1 turns a +theta reading into a -theta
+# correction, for trying an inverted sign on the real kart.
+CAMERA_FIX_STEP_YAW_SIGN = -1.0
+
 # -- Abort ------------------------------------------------------------------
 # The kart is presumed still from capture to the end of the fix.
 CAMERA_FIX_KART_MOVED_M = 0.005
@@ -892,3 +924,130 @@ CAMERA_FIX_REVERIFY = True
 # arrival CSV, under maze_solver/logs/.
 CAMERA_FIX_DEBUG_DUMP = True
 ARRIVAL_LOG_ENABLED = True
+
+
+# ---------------------------------------------------------------------------
+# Camera pose fix v2 (runner/camera_fix_v2.py, runner/edge_match.py,
+# runner/camera_cells.py)
+#
+# Replaces the per-boundary v1 fix above when CAMERA_V2_ENABLED. The head
+# looks UP (box tops) and DOWN (floor contacts) at the centre pan, then at the
+# right pan, then at the left pan. Every box edge seen is compared with the
+# same edge in the maze ray caster's image at the believed pose: per point,
+# how far the real edge sits from the simulated one along the edge normal.
+#
+# Grouping: the centre pan's points split into the LEFT and RIGHT half planes
+# of the image; each side pan is one group; upper and lower edges stay apart.
+# A shift common to the two halves (and to the two side pans) is yaw; halves
+# moving apart / together (and the side pans moving opposite ways) is a
+# longitudinal offset. The numbers come from each point's sensitivity to yaw,
+# longitudinal and lateral, computed from the simulation itself.
+#
+# Then a STEP: the yaw is corrected by TURNING the kart (belief re-anchored to
+# the measured heading, then a turn back onto the grid axis), the longitudinal
+# only by re-anchoring the belief; lateral is estimated as a nuisance and left
+# to the closest obstacle reference. Measure again, until under the acceptance
+# thresholds or out of iterations.
+#
+# Slow (6 views per iteration, plus turns), so it is SCHEDULED like
+# NEXT_BEST_CLOSEST_AS_REFERENCE: due every CAMERA_V2_EVERY_N_CELLS cells, run
+# at a cell whose geometry suits it -- the current one if it does, else the
+# first on the plan within CAMERA_V2_MAX_NEXT_BEST_CELLS (legs drop to one cell
+# until there). Nothing suitable ahead: it stays due and the next boundary
+# looks again.
+# ---------------------------------------------------------------------------
+CAMERA_V2_ENABLED = True
+CAMERA_V2_AT_START = True
+
+# Head positions. Pans are the calibration's pan views; tilts are named
+# TiltCalibration entries -- "baixo" is the held tilt (CAMERA_FIX_TILT_PCT),
+# "cima" this many units. Visiting order is the order below, every time, so
+# servo hysteresis lands each view where `extrinsics` calibrated it.
+# 8: on the real kart, 15 left the top of the box two cells ahead (~32 deg up
+# from the lens) at the very top of the frame -- the tilt servo turns only
+# ~0.5 deg per unit up there. Until `extrinsics` measures it, this tilt's pitch
+# is derived with `tilt_deg_per_pct`, which is far off; the search of
+# `extrinsics` (--span-tilt) is wide for that reason.
+CAMERA_V2_TILT_UP_PCT = 8
+CAMERA_V2_PAN_ORDER = ("frente", "direita", "esquerda")
+CAMERA_V2_TILT_ORDER = ("cima", "baixo")
+# The pan whose points split into half planes (the one facing the leg).
+CAMERA_V2_SPLIT_PAN = "frente"
+
+# -- Scheduling (runner/camera_cells.py) ------------------------------------
+CAMERA_V2_EVERY_N_CELLS = 3
+CAMERA_V2_MAX_NEXT_BEST_CELLS = MAX_NEXT_BEST_CELLS
+# A good cell, judged from the heading the kart arrives with: the cell ahead
+# open (the camera needs distance), at least this many original walls among
+# front-left / front-right one cell ahead and the three cells two ahead, and
+# -- with REQUIRE_CORRIDOR -- walls on both sides of the kart's cell or of the
+# cell ahead.
+CAMERA_V2_MIN_FRONT_OBSTACLES = 2
+CAMERA_V2_REQUIRE_CORRIDOR = True
+
+# -- Edges and matching (runner/edge_match.py) ------------------------------
+# One simulated edge point every this many pixels along each edge.
+CAMERA_V2_EDGE_STEP_PX = 3
+# Edge points this close to the image border are not used.
+CAMERA_V2_EDGE_BORDER_PX = 6
+# Edges of boxes further than this from the lens are not used (small, and the
+# segmentation of a far box is unreliable).
+CAMERA_V2_MAX_EDGE_RANGE_M = 2.0
+# How far along the normal the real edge is searched for, px. Covers ~4 deg of
+# yaw at f ~ 380 px; a larger error is the closest obstacle reference's.
+CAMERA_V2_SEARCH_PX = 30
+# Robust loss on the per-point offsets: Huber beyond this, ignored beyond
+# CAMERA_V2_OUTLIER_K times it.
+CAMERA_V2_HUBER_PX = 2.0
+CAMERA_V2_OUTLIER_K = 3.0
+# Neighbouring points see the same edge; the information is divided by this.
+CAMERA_V2_POINT_CORRELATION = 3.0
+CAMERA_V2_MIN_POINTS_PER_GROUP = 15
+CAMERA_V2_MIN_POINTS = 60
+# A group whose points the fitted pose leaves this far off (median, px) is an
+# outlier (a person, a bag, a misread colour) and the fit is redone without it.
+CAMERA_V2_GROUP_MAX_RESIDUAL_PX = 4.0
+# Gauss-Newton passes per measurement: render at the estimate, re-match.
+CAMERA_V2_INNER_ITERATIONS = 3
+# Colour model: walls vs EVERYTHING ELSE (floor, the room above the boxes).
+CAMERA_V2_SEG_COMPONENTS = 3
+
+# -- Priors -----------------------------------------------------------------
+CAMERA_V2_YAW_PRIOR_DEG = 5.0
+CAMERA_V2_LONG_PRIOR_M = 0.05
+CAMERA_V2_LAT_PRIOR_M = 0.02
+# Side pans' servo repeatability, shared by both tilts of that pan.
+# 2 deg: the pan servo lands in ~10 deg jumps (feature sweep on the real kart);
+# even with the fixed visiting order a side view can land a degree or two off.
+CAMERA_V2_PAN_NUISANCE_SIGMA_DEG = 2.0
+# A pitch error shared by every view (calibration drift, kart not level).
+CAMERA_V2_PITCH_NUISANCE_SIGMA_DEG = 1.0
+# Coarse yaw grid tried before the fine fit: +- this, in these steps.
+CAMERA_V2_COARSE_YAW_DEG = 4.0
+CAMERA_V2_COARSE_YAW_STEP_DEG = 1.0
+# An axis whose standard deviation is above this is not stepped.
+CAMERA_V2_MAX_STD_YAW_DEG = 1.0
+CAMERA_V2_MAX_STD_LONG_M = 0.02
+
+# -- The measure -> step loop (runner/camera_fix_v2.py) ----------------------
+# The job is not precision: it is to stop the residual error the reference
+# swapping leaves from ACCUMULATING over a long run until the kart grazes a
+# wall. So two measurements at most, and "good enough" accepted early.
+CAMERA_V2_MAX_ITERATIONS = 2
+# Accepted (no more steps) when both are under these.
+CAMERA_V2_ACCEPT_YAW_DEG = 1.0
+CAMERA_V2_ACCEPT_LONG_M = 0.01
+# Step per iteration: gain x estimate, clamped.
+CAMERA_V2_YAW_GAIN = 1.0
+CAMERA_V2_LONG_GAIN = 1.0
+CAMERA_V2_MAX_YAW_STEP_DEG = 3.0
+CAMERA_V2_MAX_LONG_STEP_M = 0.01
+# Turns smaller than this are not issued (the belief is still corrected; the
+# next leg's absolute goto takes the rest).
+CAMERA_V2_MIN_TURN_DEG = 0.8
+# Sign of the applied yaw step. +1 is what the geometry says; if a real run
+# keeps stopping with "yaw divergiu", the sign is the first suspect.
+CAMERA_V2_YAW_SIGN = 1.0
+# The yaw reading after a step must not grow by more than this (deg), or the
+# loop stops: a wrong sign or a wrong match would otherwise be amplified.
+CAMERA_V2_DIVERGE_DEG = 0.5

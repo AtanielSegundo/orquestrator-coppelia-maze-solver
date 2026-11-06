@@ -31,7 +31,7 @@ from camera_fixtures import (CALIB, CELL, GEOMS, ORIGIN, Corridor, Pillars,  # n
 from camera_link.floor_segmenter import FloorSegmenter                     # noqa: E402
 from camera_link.pinhole_view import PinholeView                           # noqa: E402
 from runner.arrival_policy import (MEASURE, VERIFY, NOTHING,               # noqa: E402
-                                   plan_after_camera)
+                                   plan_after_camera, step_after_camera)
 from runner.camera_fit import CONFIRMED, CORRECTED, REFUSED, CameraFit     # noqa: E402
 from runner.camera_fix import CameraFix                                    # noqa: E402
 from runner.center_move import CenterMove, cell_behind                     # noqa: E402
@@ -208,26 +208,31 @@ def _fit(outcome=CORRECTED, lat=0.02, lng=0.01, yaw=0.02):
                      0.5, ("frente",))
 
 
+def _gated_plan(*args, **kw):
+    """The gated small-vs-big table (step mode off)."""
+    return plan_after_camera(*args, step_mode=False, **kw)
+
+
 class TestArrivalPolicy(unittest.TestCase):
     """The camera makes the SMALL corrections. Translation beyond them is the
     closest obstacle reference / sweep's (escalated); yaw has no other
     corrector, so it is always applied, clamped."""
 
     def test_refused_or_confirmed_apply_nothing(self):
-        self.assertEqual(plan_after_camera(None, 0.0, MEASURE, 0, False), NOTHING)
-        self.assertEqual(plan_after_camera(_fit(REFUSED), 0.05, MEASURE, 90, False), NOTHING)
-        self.assertEqual(plan_after_camera(_fit(CONFIRMED), 0.05, MEASURE, 90, False), NOTHING)
+        self.assertEqual(_gated_plan(None, 0.0, MEASURE, 0, False), NOTHING)
+        self.assertEqual(_gated_plan(_fit(REFUSED), 0.05, MEASURE, 90, False), NOTHING)
+        self.assertEqual(_gated_plan(_fit(CONFIRMED), 0.05, MEASURE, 90, False), NOTHING)
 
     def test_small_fit_is_applied_whole(self):
         """Longitudinal too: Recenter has already driven that axis against the
         sonar by the time the camera looks, so what is left is a residual."""
-        d = plan_after_camera(_fit(), 0.0, MEASURE, 0, False, policy="never")
+        d = _gated_plan(_fit(), 0.0, MEASURE, 0, False, policy="never")
         self.assertEqual((d.longitudinal, d.lateral, d.yaw), (0.01, 0.02, 0.02))
         self.assertFalse(d.move or d.escalate)
 
     def test_big_translation_escalates_with_a_clamped_fallback(self):
         for lat, lng in ((0.05, 0.01), (0.01, -0.06)):
-            d = plan_after_camera(_fit(lat=lat, lng=lng), 0.0, MEASURE, 0, False)
+            d = _gated_plan(_fit(lat=lat, lng=lng), 0.0, MEASURE, 0, False)
             self.assertTrue(d.escalate)
             self.assertEqual((d.longitudinal, d.lateral), (0.0, 0.0))
             self.assertAlmostEqual(d.yaw, 0.02)          # yaw still applied
@@ -239,18 +244,18 @@ class TestArrivalPolicy(unittest.TestCase):
     def test_big_yaw_is_clamped_not_escalated(self):
         """No sonar corrector observes heading: escalating it would be
         escalating to nobody."""
-        d = plan_after_camera(_fit(yaw=math.radians(5.0)), 0.0, MEASURE, 0, False)
+        d = _gated_plan(_fit(yaw=math.radians(5.0)), 0.0, MEASURE, 0, False)
         self.assertFalse(d.escalate)
         self.assertAlmostEqual(d.yaw, math.radians(3.0))
         self.assertEqual(d.lateral, 0.02)
 
     def test_unobservable_components_are_not_applied(self):
-        d = plan_after_camera(_fit(lng=None, yaw=None), 0.0, MEASURE, 0, False)
+        d = _gated_plan(_fit(lng=None, yaw=None), 0.0, MEASURE, 0, False)
         self.assertEqual((d.longitudinal, d.lateral, d.yaw), (0.0, 0.02, 0.0))
         self.assertFalse(d.escalate)
 
     def test_small_bounds_can_be_overridden(self):
-        d = plan_after_camera(_fit(lat=0.04), 0.0, MEASURE, 0, False,
+        d = _gated_plan(_fit(lat=0.04), 0.0, MEASURE, 0, False,
                               small_lat_m=0.05)
         self.assertEqual(d.lateral, 0.04)
         self.assertFalse(d.escalate)
@@ -259,16 +264,59 @@ class TestArrivalPolicy(unittest.TestCase):
         """The centring move (off by default) still follows its policy for a
         small fit whose CORRECTED pose sits far enough off the axis."""
         args = (_fit(), 0.035, MEASURE)
-        self.assertTrue(plan_after_camera(*args, 0, False, policy="always").move)
-        self.assertFalse(plan_after_camera(*args, 0, False, policy="before_turns").move)
-        self.assertTrue(plan_after_camera(*args, 90, False, policy="before_turns").move)
-        self.assertTrue(plan_after_camera(*args, 0, True, policy="before_turns").move)
-        self.assertFalse(plan_after_camera(*args, 90, True, policy="never").move)
+        self.assertTrue(_gated_plan(*args, 0, False, policy="always").move)
+        self.assertFalse(_gated_plan(*args, 0, False, policy="before_turns").move)
+        self.assertTrue(_gated_plan(*args, 90, False, policy="before_turns").move)
+        self.assertTrue(_gated_plan(*args, 0, True, policy="before_turns").move)
+        self.assertFalse(_gated_plan(*args, 90, True, policy="never").move)
 
     def test_verify_pass_never_moves(self):
-        d = plan_after_camera(_fit(), 0.06, VERIFY, 90, True, policy="always")
+        d = _gated_plan(_fit(), 0.06, VERIFY, 90, True, policy="always")
         self.assertFalse(d.move)
         self.assertEqual(d.lateral, 0.02)
+
+
+class TestStepPolicy(unittest.TestCase):
+    """Step mode (the default): a bounded fraction of every component, whatever
+    the fit's confidence; never an escalation, never a move."""
+
+    def test_refused_or_confirmed_apply_nothing(self):
+        self.assertEqual(step_after_camera(None), NOTHING)
+        self.assertEqual(step_after_camera(_fit(REFUSED)), NOTHING)
+        self.assertEqual(step_after_camera(_fit(CONFIRMED)), NOTHING)
+
+    def test_small_reading_applies_the_gain(self):
+        d = step_after_camera(_fit(lat=0.006, lng=-0.004, yaw=math.radians(0.8)),
+                              gain_long=0.5, gain_lat=0.5, gain_yaw=0.5, yaw_sign=1.0)
+        self.assertAlmostEqual(d.longitudinal, -0.002)
+        self.assertAlmostEqual(d.lateral, 0.003)
+        self.assertAlmostEqual(math.degrees(d.yaw), 0.4)
+        self.assertFalse(d.move or d.escalate)
+
+    def test_big_reading_is_a_bounded_step_not_an_escalation(self):
+        for lat, lng in ((0.05, 0.01), (0.01, -0.09), (-0.035, 0.035)):
+            d = step_after_camera(_fit(lat=lat, lng=lng, yaw=math.radians(6.0)),
+                                  step_m=0.01, step_yaw_deg=1.0, yaw_sign=1.0)
+            self.assertFalse(d.escalate or d.move)
+            self.assertLessEqual(math.hypot(d.longitudinal, d.lateral), 0.01 + 1e-12)
+            self.assertEqual(math.copysign(1, d.lateral), math.copysign(1, lat))
+            self.assertEqual(math.copysign(1, d.longitudinal), math.copysign(1, lng))
+            self.assertAlmostEqual(math.degrees(d.yaw), 1.0)
+
+    def test_default_policy_is_the_step(self):
+        d = plan_after_camera(_fit(lat=0.05, lng=0.0), 0.06, MEASURE, 90, True,
+                              policy="always", step_mode=True)
+        self.assertFalse(d.escalate or d.move)
+        self.assertLessEqual(abs(d.lateral), 0.0100001)
+
+    def test_yaw_sign_inverts_the_yaw_step(self):
+        d = step_after_camera(_fit(yaw=math.radians(0.8)), gain_yaw=1.0, yaw_sign=-1.0)
+        self.assertAlmostEqual(math.degrees(d.yaw), -0.8)
+
+    def test_unobservable_components_count_as_zero(self):
+        d = step_after_camera(_fit(lng=None, yaw=None, lat=0.004), gain_lat=1.0)
+        self.assertEqual((d.longitudinal, d.yaw), (0.0, 0.0))
+        self.assertAlmostEqual(d.lateral, 0.004)
 
 
 class FakeKart:

@@ -194,9 +194,12 @@ class TestClosedLoop(unittest.TestCase):
             for n in names:
                 cls._saved[(mod, n)] = getattr(mod, n)
                 setattr(mod, n, 0.0)
+        # This pins the v1 per-boundary fix; v2 has its own loop test
+        # (tests/test_camera_v2.py) and a head this test's stream cannot tilt.
         for n, v in (("CAMERA_FIX_DEBUG_DUMP", False),
                      ("CLOSEST_OBSTACLE_AS_REFERENCE", True),
-                     ("SWEEP_EVERY_N_LEGS", 1)):
+                     ("SWEEP_EVERY_N_LEGS", 1),
+                     ("CAMERA_V2_ENABLED", False)):
             cls._saved[(runner_mod, n)] = getattr(runner_mod, n)
             setattr(runner_mod, n, v)
 

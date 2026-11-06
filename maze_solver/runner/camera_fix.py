@@ -152,6 +152,9 @@ class CameraFix:
         self._worker_dropped: Dict[str, str] = {}
         self._debug: Dict[str, tuple] = {}
         self._debug_paths: List[str] = []
+        # Undistorted first frame of every view captured, kept even when the
+        # colour model drops the view (bench tool: real vs simulated images).
+        self.frames: Dict[str, np.ndarray] = {}
         self.segmenter = FloorSegmenter(components=CAMERA_SEG_COMPONENTS,
                                         l_weight=CAMERA_SEG_L_WEIGHT,
                                         margin_px=CAMERA_SEG_LABEL_MARGIN_PX,
@@ -394,6 +397,7 @@ class CameraFix:
         geom = self.geoms[bundle.name]
         prepared = [self._prepare(f) for f in bundle.frames]
         img0, invalid = prepared[0]
+        self.frames[bundle.name] = img0
         H, W = img0.shape[:2]
         labels = render_labels(geom.pinhole, self.capture_pose, self.world,
                                max_range=geom.max_range, stride=_LABEL_STRIDE,
