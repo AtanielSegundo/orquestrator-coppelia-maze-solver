@@ -35,6 +35,11 @@ the loop ("divergiu"): a wrong sign or a wrong match would only be amplified.
 `act=False` measures once and applies nothing (bench `check`, the runner's
 `camfix`); `measure_only` stops after the wallness fields (bench
 `extrinsics`, which fits the calibration to them instead of the pose).
+
+`face_theta`: the world heading to measure from. When the kart is not facing
+it, the session first turns there (in steps of at most 90 deg) -- the runner
+asks for the next leg's heading when only that one sees enough boxes, a turn
+the leg would make anyway.
 """
 from __future__ import annotations
 
@@ -343,6 +348,7 @@ class CameraFixV2:
                  on_step: Optional[OnStep] = None, turn_speed: float = 0.35,
                  measure_only: bool = False, views=None,
                  max_iterations: int = CAMERA_V2_MAX_ITERATIONS,
+                 face_theta: Optional[float] = None,
                  dump_dir: Optional[str] = None, clock=time.monotonic):
         self.calib = calib
         self.head = head
@@ -398,7 +404,10 @@ class CameraFixV2:
         self._issued = False
         self._seen_active = False
         self._active_by = 0.0
-        self._last_after_turn = False
+        # What a finished turn leads to: "face" (the turn to the measuring
+        # heading), "next" (another measurement), "last" (the end).
+        self._after_turn = "next"
+        self._face = face_theta if self.act else None
         if not self.views:
             self._finish(REFUSED, "calibracao sem vistas v2 (tilts/pans)")
 
@@ -455,6 +464,15 @@ class CameraFixV2:
             return "pending"
         if self._clock() < self._settle_until or odom_pose is None:
             return "pending"
+        if self._face is not None:
+            delta = math.degrees(_wrap(self._face - wth))
+            if abs(delta) < CAMERA_V2_MIN_TURN_DEG:
+                self._face = None
+            else:
+                step = _clamp(delta, 90.0)
+                if abs(step - delta) < 1e-9:
+                    self._face = None          # this turn gets there
+                return self._turn(step, "face", f"virando {step:+.0f} deg para medir")
         self.capture_pose = (float(wx), float(wy), float(wth))
         self._odom_capture = tuple(odom_pose)
         self.capture_rel = compose(inverse(self.odom_ref), self._odom_capture)
@@ -626,18 +644,22 @@ class CameraFixV2:
             turn = 0.0
         record(step_long, step_yaw, turn)
         if turn:
-            self.link.turn(turn, self.turn_speed)
             self.turned_deg += turn
-            self._issued = True
-            self._seen_active = False
-            self._active_by = self._clock() + SWEEP_START_GRACE_S
-            self._phase = "turning"
-            self._last_after_turn = last
-            self.status = f"girando {turn:+.1f} deg para o eixo"
-            return "pending"
+            return self._turn(turn, "last" if last else "next",
+                              f"girando {turn:+.1f} deg para o eixo")
         if last:
             return self._finish(CORRECTED, "sem mais medidas")
         return self._next_iteration()
+
+    def _turn(self, delta_deg: float, then: str, status: str) -> str:
+        self.link.turn(delta_deg, self.turn_speed)
+        self._issued = True
+        self._seen_active = False
+        self._active_by = self._clock() + SWEEP_START_GRACE_S
+        self._phase = "turning"
+        self._after_turn = then
+        self.status = status
+        return "pending"
 
     def _do_turning(self, drive_tel) -> str:
         if drive_tel.get("goal_active"):
@@ -646,8 +668,15 @@ class CameraFixV2:
             return "pending"
         if drive_tel.get("goal_active"):
             return "pending"
-        if self._last_after_turn:
+        if self._after_turn == "last":
             return self._finish(CORRECTED, "sem mais medidas")
+        if self._after_turn == "face":
+            # Back to settling; the settle phase checks the heading again
+            # (a turn over 90 deg is issued in two).
+            self._phase = "settle_kart"
+            self._settle_until = self._clock() + SWEEP_SETTLE_S
+            self.status = "assentando kart"
+            return "pending"
         return self._next_iteration(SWEEP_SETTLE_S)
 
     def _next_iteration(self, settle: float = CAMERA_FIX_KART_SETTLE_S) -> str:

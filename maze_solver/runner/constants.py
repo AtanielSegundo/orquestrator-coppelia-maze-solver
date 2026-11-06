@@ -440,6 +440,13 @@ CLOSEST_OBSTACLE_MINIMAL_DELTA_CM = 3.0
 # between the sides.
 CLOSEST_OBSTACLE_ALWAYS_CHECKS_THE_TWO = False
 
+# When the side the correction turned to IS the next leg's heading, stay
+# facing it instead of turning back: turn out, read, (move, re-read), and the
+# next leg -- and the camera, if it runs here -- starts with no turn. Saves the
+# back-and-forth (A -> B -> A, then the leg's A -> B) at no cost to the
+# measurement: the turn out already lands exactly on a grid axis.
+CLOSEST_OBSTACLE_KEEPS_NEXT_HEADING = True
+
 # Postpone a due correction to a BETTER reference ahead on the path. Only
 # acts with CLOSEST_OBSTACLE_AS_REFERENCE on.
 #

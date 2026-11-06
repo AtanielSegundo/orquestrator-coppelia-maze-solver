@@ -251,6 +251,7 @@ class ClosestObstacleFix:
     def __init__(self, view, origin, cell_length, link, wx, wy, wth,
                  last_turn: int = 0, turn_speed: float = 0.35,
                  force_side: Optional[int] = None, both: Optional[bool] = None,
+                 keep_heading: Optional[float] = None,
                  clock=time.monotonic):
         self._clock = clock
         self.view = view
@@ -276,6 +277,11 @@ class ClosestObstacleFix:
             self.refused = ("sem referencia lateral (" + "; ".join(
                 f"{r.label}: {r.reason}" for r in self.refs.values()) + ")")
         self.last_side = self.sides[-1] if self.sides else 0
+
+        # The next leg's world heading: if the last side faced is it, the
+        # session ends there instead of turning back (`kept_heading`).
+        self.keep_heading = keep_heading
+        self.kept_heading = False
 
         self.succeeded = False
         self.anchor_shift: Optional[Tuple[float, float]] = None
@@ -333,12 +339,24 @@ class ClosestObstacleFix:
         self._settle_until = self._clock() + SWEEP_SETTLE_S
 
     def _next_side(self) -> None:
-        """This side is finished: on to the next one, or back to the leg."""
+        """This side is finished: on to the next one, back to the leg -- or,
+        when this side is the next leg's heading, stay (the kart is settled
+        and on an exact grid axis already)."""
+        facing = self.axis + self.turn * HALF_PI
         self._i += 1
         self._issued = False
         self.first_error_m = None
         self.moved_m = None
-        self._phase = "turn_out" if self._i < len(self.sides) else "turn_back"
+        if self._i < len(self.sides):
+            self._phase = "turn_out"
+        elif (self.keep_heading is not None
+              and abs(_wrap(facing - self.keep_heading)) < math.radians(5.0)):
+            self.kept_heading = True
+            self._parts.append("fica virado para a proxima perna")
+            self._phase = "done"
+            self.status = self.summary()
+        else:
+            self._phase = "turn_back"
 
     # -- main poll ---------------------------------------------------------
     def poll(self, drive_tel: dict, wx: float, wy: float, wth: float) -> str:

@@ -20,7 +20,8 @@ import numpy as np                                                       # noqa:
 
 from camera_link.camera_calibration import CameraCalibration             # noqa: E402
 from camera_link.pinhole_view import PinholeView                         # noqa: E402
-from runner.camera_cells import camera_cell, find_camera_cell            # noqa: E402
+from runner.camera_cells import (best_heading, camera_cell,              # noqa: E402
+                                 find_camera_cell, path_headings)
 from runner.camera_fix_v2 import (ACCEPTED, CORRECTED, CameraFixV2,      # noqa: E402
                                   PoseParams, make_segmenter, measure_view)
 from runner.camera_setup import default_calibration, v2_views            # noqa: E402
@@ -114,9 +115,19 @@ class TestCameraCells(unittest.TestCase):
         # Facing 180 along row 3: (3, 7) already has (2, 5) and (4, 5) two
         # cells ahead and walls on both sides of (3, 6).
         path = [(3, 8), (3, 7), (3, 6), (3, 5)]
-        self.assertEqual(find_camera_cell(VIEW, path, 0, 8), 1)
-        self.assertEqual(find_camera_cell(VIEW, path, 1, 8), 2)
+        self.assertEqual(find_camera_cell(VIEW, path, 0, 8)[0], 1)
+        self.assertEqual(find_camera_cell(VIEW, path, 1, 8)[0], 2)
         self.assertIsNone(find_camera_cell(VIEW, path, 0, 0))
+
+    def test_departure_heading_counts_when_arrival_does_not(self):
+        # Arriving at (2, 3) facing north sees one box; leaving east it faces
+        # the pocket (1, 4), (3, 4), (2, 5).
+        view, path = Pocket(), [(3, 3), (2, 3), (2, 4)]
+        self.assertFalse(camera_cell(view, (2, 3), math.pi / 2).ok)
+        theta, q = best_heading(view, (2, 3), path_headings(path, 1))
+        self.assertTrue(q.ok)
+        self.assertAlmostEqual(math.remainder(theta, 2 * math.pi), 0.0)
+        self.assertEqual(find_camera_cell(view, path, 0, 8)[0], 1)
 
 
 class TestEdgeFit(unittest.TestCase):
@@ -307,23 +318,32 @@ class TestRunnerSchedule(unittest.TestCase):
         from runner.arrival_policy import MEASURE
         r = self.runner()
         self.assertFalse(r._start_camera_v2(MEASURE, *self.pose((2, 1))))
-        self.assertEqual(r._camera_next, (3, (2, 3)))
+        self.assertEqual(r._camera_next[:2], (3, (2, 3)))
         # On the way (index 2): still one cell at a time, nothing started.
         r.plan_index = 2
         self.assertFalse(r._start_camera_v2(MEASURE, *self.pose((2, 2))))
-        self.assertEqual(r._camera_next, (3, (2, 3)))
+        self.assertEqual(r._camera_next[:2], (3, (2, 3)))
         r.plan_index = 3
         self.assertTrue(r._start_camera_v2(MEASURE, *self.pose((2, 3))))
         self.assertIsInstance(r.camera_fix, CameraFixV2)
         self.assertIsNone(r._camera_next)
 
-    def test_nothing_good_ahead_stays_due(self):
+    def test_nothing_good_ahead_runs_here_anyway(self):
         from runner.arrival_policy import MEASURE
         r = self.runner()
         r.view.walls = frozenset()
-        self.assertFalse(r._start_camera_v2(MEASURE, *self.pose((2, 1))))
+        self.assertTrue(r._start_camera_v2(MEASURE, *self.pose((2, 1))))
+        self.assertIsInstance(r.camera_fix, CameraFixV2)
         self.assertIsNone(r._camera_next)
-        self.assertEqual(r._cells_since_camera, 3)
+
+    def test_good_only_leaving_turns_to_the_next_leg_first(self):
+        from runner.arrival_policy import MEASURE
+        r = self.runner()
+        r.plan_path, r.plan_index = [(3, 3), (2, 3), (2, 4)], 1
+        # Arrived facing north; the pocket is east, the next leg's heading.
+        x, y = offset_pose((2, 3), 0.0, 0.0, 0.0, 0.0)[:2]
+        self.assertTrue(r._start_camera_v2(MEASURE, x, y, math.pi / 2))
+        self.assertAlmostEqual(math.remainder(r.camera_fix._face, 2 * math.pi), 0.0)
 
 
 if __name__ == "__main__":

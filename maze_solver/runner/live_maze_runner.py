@@ -24,6 +24,7 @@ from runner.constants import (
     OBSTACLE_STEADY_SPEED_MPS, OBSTACLE_CONFIRM_S, OBSTACLE_SUSPECT_TIMEOUT_S,
     SWEEP_EVERY_N_LEGS, LEG_MAX_CELLS, CLOSEST_OBSTACLE_AS_REFERENCE,
     NEXT_BEST_CLOSEST_AS_REFERENCE, MAX_NEXT_BEST_CELLS,
+    CLOSEST_OBSTACLE_KEEPS_NEXT_HEADING,
     ARRIVAL_LOG_ENABLED, CAMERA_FIX_AT_START, CAMERA_FIX_DEBUG_DUMP,
     CAMERA_FIX_ENABLED, CAMERA_FIX_ESCALATES, CAMERA_FIX_HOLD_TILT,
     CAMERA_FIX_MOVE_MODE, CAMERA_FIX_REVERIFY, CAMERA_FIX_YAW_GAIN,
@@ -32,7 +33,8 @@ from runner.constants import (
 )
 from runner.arrival_log import ArrivalLog, _cm, _deg
 from runner.arrival_policy import MEASURE, START, VERIFY, plan_after_camera
-from runner.camera_cells import camera_cell, find_camera_cell
+from runner.camera_cells import (best_heading, find_camera_cell, heading_deg,
+                                 path_headings)
 from runner.camera_fix import CameraFix
 from runner.camera_fix_v2 import CameraFixV2
 from runner.camera_setup import build_view_geometries, load_camera_calibration
@@ -1175,7 +1177,8 @@ class LiveMazeRunner:
                                  self.link, wx, wy, wth,
                                  last_turn=self._last_side_turn,
                                  turn_speed=self.turn_speed,
-                                 force_side=force)
+                                 force_side=force,
+                                 keep_heading=self._next_leg_heading())
         if fix.refused is not None:
             self.last_sweep_summary = fix.summary()
             print(f"[INFO] referencia lateral: {fix.summary()} -- tento na proxima")
@@ -1184,6 +1187,16 @@ class LiveMazeRunner:
         self.side_ref = fix
         self._side_ref_scheduled = scheduled
         return True
+
+    def _next_leg_heading(self) -> Optional[float]:
+        """World heading of the leg that leaves this boundary, for
+        CLOSEST_OBSTACLE_KEEPS_NEXT_HEADING; None at the goal or when off."""
+        if (not CLOSEST_OBSTACLE_KEEPS_NEXT_HEADING or not self.plan_path
+                or self.plan_index + 1 >= len(self.plan_path)):
+            return None
+        h = heading_between(self.plan_path[self.plan_index],
+                            self.plan_path[self.plan_index + 1])
+        return None if h is None else grid_heading_to_world_theta(h)
 
     def _schedule_next_best(self) -> bool:
         """Look up to MAX_NEXT_BEST_CELLS ahead for a cell with a better side
@@ -1217,9 +1230,11 @@ class LiveMazeRunner:
             self._end_next_best()
 
     def _poll_side_ref(self, drive_tel, wx, wy, wth):
-        """Drive the correction forward one frame. Once the kart is back on the
-        leg heading, apply the anchor shift it measured -- AFTER the physical
-        move, which odometry tracked and so did not fix the belief by itself."""
+        """Drive the correction forward one frame. Once the session is over --
+        back on the leg heading, or facing the NEXT leg's when that is the side
+        it turned to (CLOSEST_OBSTACLE_KEEPS_NEXT_HEADING) -- apply the anchor
+        shift it measured, AFTER the physical move, which odometry tracked and
+        so did not fix the belief by itself."""
         outcome = self.side_ref.poll(drive_tel, wx, wy, wth)
         if outcome == "pending":
             self.status = f"referencia lateral: {self.side_ref.status}"
@@ -1463,10 +1478,14 @@ class LiveMazeRunner:
     #
     # Scheduled like NEXT_BEST_CLOSEST_AS_REFERENCE: due every
     # CAMERA_V2_EVERY_N_CELLS cells, it runs at the current boundary if the
-    # cell suits it (runner/camera_cells.py); otherwise the first suitable
-    # cell within CAMERA_V2_MAX_NEXT_BEST_CELLS on the plan is chosen and legs
-    # drop to one cell until it is reached. Nothing suitable: it stays due.
-    def _make_camera_v2(self, purpose: str, act: bool = True) -> CameraFixV2:
+    # cell suits it facing the kart's heading or the next leg's
+    # (runner/camera_cells.py); otherwise the first suitable cell within
+    # CAMERA_V2_MAX_NEXT_BEST_CELLS on the plan is chosen and legs drop to one
+    # cell until it is reached. Nothing suitable ahead: it runs HERE anyway,
+    # facing the least bad of the two headings -- a measurement in a poor
+    # place beats letting the error grow for another interval.
+    def _make_camera_v2(self, purpose: str, act: bool = True,
+                        face_theta: Optional[float] = None) -> CameraFixV2:
         world = build_wall_world(self.view, self.origin, self.cell_length,
                                  inset=self.camera_calib.wall_inset_m,
                                  box_height=self.camera_calib.box_height_m)
@@ -1474,46 +1493,73 @@ class LiveMazeRunner:
         return CameraFixV2(self.camera_calib, self.camera, self.camera_stream,
                            self.link, world, self.odom_ref, purpose=purpose, act=act,
                            on_step=self._apply_camera_v2_step,
-                           turn_speed=self.turn_speed, dump_dir=dump)
+                           turn_speed=self.turn_speed, face_theta=face_theta,
+                           dump_dir=dump)
+
+    def _here_headings(self, wth):
+        """Headings the kart can measure from at this boundary without an extra
+        turn: the one it is facing, then the next leg's."""
+        out = [snap_to_axis(wth)]
+        if self.plan_path:
+            for th in path_headings(self.plan_path, self.plan_index):
+                if all(abs(math.remainder(th - o, 2 * math.pi)) > 1e-6 for o in out):
+                    out.append(th)
+        return out
 
     def _start_camera_v2(self, purpose: str, wx, wy, wth) -> bool:
-        """Start the v2 fix here if it is due and this cell suits it, or
-        postpone it to a suitable cell ahead. True when it started."""
+        """Start the v2 fix here if it is due (or at the start) and this cell
+        suits it, postpone it to a suitable cell ahead, or -- due and nothing
+        suitable ahead -- run it here anyway. True when it started."""
         cell = self._nearest_cell(wx, wy)
-        forced = False
+        face, why = None, ""
         if self._camera_next is not None:
-            index, target = self._camera_next
+            index, target, theta = self._camera_next
             if self.plan_index < index:
                 return False                    # not there yet: on, one cell at a time
             self._camera_next = None
-            forced = self.plan_index == index and self.plan_path[index] == target
+            if self.plan_index == index and self.plan_path[index] == target:
+                face, why = theta, "celula boa escolhida antes"
         elif purpose != START and self._cells_since_camera < CAMERA_V2_EVERY_N_CELLS:
             return False
-        if not forced:
-            quality = camera_cell(self.view, cell, wth)
-            if not quality.ok:
-                if purpose == START:
-                    self.last_camera_summary = f"inicio: celula ruim para a camera ({quality.reason})"
-                    return False
+        if face is None:
+            theta, quality = best_heading(self.view, cell, self._here_headings(wth))
+            if quality is None:
+                return False
+            if quality.ok:
+                face, why = theta, "celula boa"
+            elif purpose == START:
+                self.last_camera_summary = (f"inicio: {cell} ruim para a camera "
+                                            f"({quality.reason}); primeira medida em "
+                                            f"{CAMERA_V2_EVERY_N_CELLS} celulas")
+                print(f"[INFO] camera v2 {self.last_camera_summary}")
+                return False
+            else:
                 found = find_camera_cell(self.view, self.plan_path, self.plan_index,
                                          CAMERA_V2_MAX_NEXT_BEST_CELLS)
-                if found is None:
-                    # Stays due: the next boundary looks again.
-                    self.last_camera_summary = (f"devida, sem celula boa nas proximas "
-                                                f"{CAMERA_V2_MAX_NEXT_BEST_CELLS} ({cell}: "
-                                                f"{quality.reason})")
+                if found is not None:
+                    index, th = found
+                    self._camera_next = (index, self.plan_path[index], th)
+                    self.last_camera_summary = (
+                        f"devida; adiada para {self.plan_path[index]} virado para "
+                        f"{heading_deg(th)} deg ({cell}: {quality.reason})")
+                    print(f"[INFO] camera v2 {self.last_camera_summary} "
+                          f"-- uma celula por vez ate la")
                     return False
-                self._camera_next = (found, self.plan_path[found])
-                self.last_camera_summary = (f"adiada para {self.plan_path[found]} "
-                                            f"({cell}: {quality.reason})")
-                print(f"[INFO] camera v2 {self.last_camera_summary} -- uma celula por vez ate la")
-                return False
-        self.camera_fix = self._make_camera_v2(purpose)
+                face = theta
+                why = (f"sem celula boa nas proximas {CAMERA_V2_MAX_NEXT_BEST_CELLS}, "
+                       f"medindo assim mesmo: {quality.reason}")
+        turn = math.degrees(math.remainder(face - wth, 2 * math.pi))
+        self.last_camera_summary = (f"medindo em {cell} virado para {heading_deg(face)} deg "
+                                    f"({why})")
+        print(f"[INFO] camera v2 ({purpose}): {self.last_camera_summary}"
+              + (f" -- girando {turn:+.0f} deg antes" if abs(turn) >= 1.0 else ""))
+        self.camera_fix = self._make_camera_v2(purpose, face_theta=face)
         return True
 
     def _cancel_camera_next(self, why):
         if self._camera_next is not None:
-            print(f"[INFO] camera v2 adiada para {self._camera_next[1]} cancelada ({why})")
+            print(f"[INFO] camera v2 adiada para {self._camera_next[1]} cancelada ({why}) "
+                  f"-- continua devida")
             self._camera_next = None
 
     def _apply_camera_v2_step(self, rel, capture_pose, a, psi):

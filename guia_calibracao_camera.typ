@@ -352,12 +352,18 @@ painéis do `extrinsics`.
 O runner lê o `camera_link/camera_calib.json` sozinho (`--camera-calib` para
 outro arquivo, `--no-camera-fix` para desligar a câmera).
 
-- *Quando roda:* fica devida a cada `CAMERA_V2_EVERY_N_CELLS` células (3). Se
-  a célula atual for boa (seção 4), roda ali, depois da recentragem e da
-  referência lateral. Senão, procura a primeira célula boa no plano até
+- *Quando roda:* fica devida a cada `CAMERA_V2_EVERY_N_CELLS` células (3). Cada
+  célula é avaliada virada para onde o kart *chega* e, se não servir, para onde
+  a *próxima perna sai* (o kart faz antes o giro que a perna faria de qualquer
+  jeito). Se a célula atual for boa (seção 4), roda ali, depois da recentragem
+  e da referência lateral. Senão, procura a primeira célula boa no plano até
   `CAMERA_V2_MAX_NEXT_BEST_CELLS` (8) à frente e vai *uma célula por vez* até
-  ela, como o `NEXT_BEST_CLOSEST_AS_REFERENCE`. Sem célula boa à vista, continua
-  devida e tenta na próxima.
+  ela, como o `NEXT_BEST_CLOSEST_AS_REFERENCE`. Sem célula boa nas 8, *mede ali
+  mesmo*, virada no rumo menos ruim. Cada decisão aparece no terminal
+  (`[INFO] camera v2 ...`).
+- *Referência lateral:* se o lado para onde ela gira é o rumo da próxima perna,
+  o kart fica virado para lá em vez de voltar
+  (`CLOSEST_OBSTACLE_KEEPS_NEXT_HEADING`).
 - *O laço:* mede; o *yaw* é corrigido girando o kart de volta ao eixo do
   labirinto (antes, a crença recebe o rumo medido, senão a próxima perna
   desfaria o giro); a *longitudinal* só move a âncora. Mede de novo, no máximo

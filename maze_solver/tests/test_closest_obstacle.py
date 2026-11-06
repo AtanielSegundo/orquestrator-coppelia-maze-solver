@@ -208,6 +208,29 @@ class TestCorrection(unittest.TestCase):
         self.assertEqual([c[0] for c in kart.commands], ["turn", "turn"])
         self.assertAlmostEqual(math.remainder(kart.th - NORTH, 2 * math.pi), 0.0)
 
+    def test_stays_facing_the_wall_when_it_is_the_next_legs_heading(self):
+        """A -> B, not A -> B -> A then the leg's A -> B."""
+        kart = SideKart(self.view, (self.c[0] - 0.03, self.c[1]), self.c)
+        west = NORTH + math.pi / 2                       # +90 from north
+        fix = ClosestObstacleFix(self.view, ORIGIN, CELL, kart, *kart.belief(),
+                                 both=False, keep_heading=west,
+                                 clock=self.clock.monotonic)
+        run(fix, kart, self.clock)
+        self.assertTrue(fix.succeeded and fix.kept_heading)
+        self.assertEqual([c[0] for c in kart.commands], ["turn", "drive_distance"])
+        self.assertAlmostEqual(math.remainder(kart.th - west, 2 * math.pi), 0.0, places=9)
+        self.assertAlmostEqual(kart.x, self.c[0], places=6)
+
+    def test_turns_back_when_the_next_leg_goes_elsewhere(self):
+        kart = SideKart(self.view, self.c, self.c)
+        fix = ClosestObstacleFix(self.view, ORIGIN, CELL, kart, *kart.belief(),
+                                 both=False, keep_heading=NORTH - math.pi / 2,
+                                 clock=self.clock.monotonic)
+        run(fix, kart, self.clock)
+        self.assertFalse(fix.kept_heading)
+        self.assertEqual([c[0] for c in kart.commands], ["turn", "turn"])
+        self.assertAlmostEqual(math.remainder(kart.th - NORTH, 2 * math.pi), 0.0)
+
     def test_turn_back_also_removes_arrival_heading_error(self):
         kart = SideKart(self.view, self.c, self.c, th=NORTH + math.radians(4))
         run(self.session(kart), kart, self.clock)
